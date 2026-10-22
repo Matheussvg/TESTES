@@ -1,0 +1,10 @@
+{
+  "name": "nucleo-trader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Robô de trade simulado 24h em BTC/BRL com dados reais da Binance",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "redis": "4.7.0" }
+}
