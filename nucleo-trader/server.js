@@ -73,14 +73,22 @@ async function save(force) {
 
 /* ---------------- dados de mercado ---------------- */
 const toC = k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] });
+let cooldownUntil = 0;
 async function fetchJSON(p) {
+  const wait = cooldownUntil - Date.now();
+  if (wait > 0) throw new Error('aguardando a Binance liberar o acesso (' + Math.ceil(wait / 1000) + ' s)');
   let err;
   for (const h of REST) {
     try {
       const r = await fetch(h + p, { signal: AbortSignal.timeout(8000) });
+      if (r.status === 429 || r.status === 418) {
+        const ra = Math.max(30, +r.headers.get('retry-after') || 60);
+        cooldownUntil = Date.now() + ra * 1000;
+        throw new Error('Binance pediu para esperar ' + ra + ' s (HTTP ' + r.status + ')');
+      }
       if (!r.ok) throw new Error(h + ' HTTP ' + r.status);
       return await r.json();
-    } catch (e) { err = e }
+    } catch (e) { err = e; if (cooldownUntil > Date.now()) break }
   }
   throw err;
 }
@@ -92,45 +100,58 @@ async function loadHistory() {
   }
   S.candles = out;
 }
-function merge(arr, ks, ms) {
-  let added = 0, gap = false;
-  for (const k of ks) {
-    const last = arr[arr.length - 1];
-    if (!last || k.t > last.t) { if (last && k.t - last.t > ms) gap = true; arr.push(k); added++; if (arr.length > MAXC) arr.shift() }
-    else { const j = arr.findIndex(x => x.t === k.t); if (j >= 0) arr[j] = k }
-  }
-  return { added, gap };
+// Preço ao vivo pelo WebSocket da Binance: não gasta limite de requisições (o REST é usado só para o histórico).
+const WSS = process.env.WS_URL ? [process.env.WS_URL] : ['wss://data-stream.binance.vision/stream?streams=', 'wss://stream.binance.com:9443/stream?streams='];
+let ws = null, wsIdx = 0, lastMsg = 0, reconnecting = false, warned = false;
+function connectWS() {
+  const streams = E.TFS.map(t => SYMBOL.toLowerCase() + '@kline_' + t.id).join('/');
+  const url = WSS[wsIdx % WSS.length] + streams;
+  let me;
+  try { me = ws = new WebSocket(url) } catch (e) { return scheduleReconnect('erro ao abrir a conexão: ' + e.message) }
+  me.onopen = () => { if (me !== ws) return; lastMsg = Date.now(); console.log('WebSocket conectado:', url.split('?')[0]) };
+  me.onmessage = ev => {
+    if (me !== ws) return; lastMsg = Date.now();
+    try { const m = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); if (m.data && m.data.k) onKline(m.data.k) }
+    catch (e) { console.error('mensagem inválida:', e.message) }
+  };
+  me.onclose = () => { if (me === ws) scheduleReconnect('conexão com a Binance caiu') };
+  me.onerror = () => { try { me.close() } catch (e) { } };
 }
-
-let failCount = 0;
-async function poll() {
-  try {
-    const ks = (await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=1m&limit=3`)).map(toC);
-    failCount = 0; S.dataOk = true; S.lastErr = null;
-    const one = S.candles['1m'];
-    const { added, gap } = merge(one, ks, 60e3);
-    if (gap) { log('Detectei um buraco nos dados (o servidor ficou parado). Recarregando o histórico.', 'w'); await loadHistory() }
-    const px = ks[ks.length - 1].c, nowT = ks[ks.length - 1].t;
-    // candles maiores em formação acompanham o preço
-    const toClose = [];
-    for (const tf of E.TFS.slice(1)) {
-      const arr = S.candles[tf.id], last = arr[arr.length - 1], b = Math.floor(nowT / tf.ms) * tf.ms;
-      if (b === last.t) { last.h = Math.max(last.h, px); last.l = Math.min(last.l, px); last.c = px }
-      else if (b > last.t) {
-        const d = (await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=${tf.id}&limit=3`)).map(toC);
-        if (merge(arr, d, tf.ms).gap) { await loadHistory(); break } toClose.push(tf.id);
-      }
+function scheduleReconnect(why) {
+  if (reconnecting) return; reconnecting = true;
+  if (ws) { const o = ws; ws = null; try { o.onclose = null; o.close() } catch (e) { } }
+  S.lastErr = why; wsIdx++;
+  const retry = async () => {
+    try { await loadHistory() }
+    catch (e) {
+      S.lastErr = e.message;
+      const w = Math.max(30000, cooldownUntil - Date.now());
+      log('Não consegui recarregar o histórico (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 'w');
+      return setTimeout(retry, w);
     }
-    tick(px);
-    if (added > 0 && !gap) candleClosed('1m', one.length - 2);
-    for (const id of toClose) candleClosed(id, S.candles[id].length - 2);
-  } catch (e) {
-    failCount++; S.lastErr = e.message;
-    if (failCount === 3) log('Sem resposta da Binance há alguns segundos (' + e.message + '). Sigo tentando.', 'w');
-    if (failCount > 15) S.dataOk = false;
-  }
-  setTimeout(poll, 2000);
+    reconnecting = false; connectWS();
+  };
+  setTimeout(retry, 5000);
 }
+function onKline(k) {
+  const tf = k.i, arr = S.candles[tf]; if (!arr) return;
+  const c = { t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v }, last = arr[arr.length - 1];
+  if (last && last.t === c.t) arr[arr.length - 1] = c;
+  else if (!last || c.t > last.t) { arr.push(c); if (arr.length > MAXC) arr.shift() }
+  else return;
+  if (!S.dataOk || warned) { if (warned) log('Dados da Binance voltaram ao normal.', 'k'); warned = false }
+  S.dataOk = true; S.lastErr = null;
+  if (tf === '1m') tick(c.c);
+  if (k.x) candleClosed(tf, arr.length - 1);
+}
+setInterval(() => {
+  if (!lastMsg || reconnecting) return;
+  if (Date.now() - lastMsg > 60000) {
+    S.dataOk = false;
+    if (!warned) { warned = true; log('Sem preço da Binance há mais de 1 minuto. Reconectando.', 'w') }
+    lastMsg = Date.now(); scheduleReconnect('sem mensagens da Binance');
+  }
+}, 15000);
 
 /* ---------------- cérebro ---------------- */
 function rowOf(r) { return r && { key: r.key, tf: r.tf, nome: r.st.nome, fam: r.st.fam, f: r.st.f || null, risco: r.rk.nome, perDay: r.perDay, win: r.win, trades: r.trades, mdd: r.mdd, score: r.score } }
@@ -304,7 +325,7 @@ async function boot() {
   }
   for (;;) {
     try { await loadHistory(); break }
-    catch (e) { S.lastErr = e.message; log('Não consegui baixar o histórico da Binance (' + e.message + '). Tento de novo em 15 s.', 's'); await new Promise(r => setTimeout(r, 15000)) }
+    catch (e) { S.lastErr = e.message; const w = Math.max(15000, cooldownUntil - Date.now()); log('Não consegui baixar o histórico da Binance (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 's'); await new Promise(r => setTimeout(r, w)) }
   }
   const one = S.candles['1m']; S.price = one[one.length - 1].c; S.lastTick = Date.now(); S.dataOk = true;
   log(`Histórico carregado: ${E.TFS.map(t => S.candles[t.id].length + '×' + t.id).join(', ')}.`);
@@ -317,7 +338,7 @@ async function boot() {
     log(`Retomei a posição aberta de ${S.acc.pos.dir > 0 ? 'compra' : 'venda'} a ${fmtPx(S.acc.pos.entry)}.`, 'k');
   }
   updateVotes(); save(true);
-  setTimeout(poll, 1000);
+  connectWS(); lastMsg = Date.now();
   setInterval(() => { if (S.ranking.length && Date.now() - S.lastTour > CFG.evalMs * 2) runTournament(false) }, 15000);
   // o plano grátis do Render dorme sem acessos; o próprio robô se acessa a cada 10 min
   const ext = process.env.RENDER_EXTERNAL_URL;
