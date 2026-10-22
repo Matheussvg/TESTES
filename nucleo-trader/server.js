@@ -313,6 +313,9 @@ const server = http.createServer((req, res) => {
 /* ---------------- inicialização ---------------- */
 async function boot() {
   server.listen(PORT, () => console.log('Núcleo Trader ouvindo na porta ' + PORT));
+  // o plano grátis do Render dorme sem acessos; o próprio robô se acessa a cada 10 min (já desde o início, mesmo esperando a Binance)
+  const ext = process.env.RENDER_EXTERNAL_URL;
+  if (ext) setInterval(() => fetch(ext + '/health').catch(() => { }), 10 * 60e3);
   await initRedis();
   const st = await loadState();
   if (st && st.acc) {
@@ -340,9 +343,6 @@ async function boot() {
   updateVotes(); save(true);
   connectWS(); lastMsg = Date.now();
   setInterval(() => { if (S.ranking.length && Date.now() - S.lastTour > CFG.evalMs * 2) runTournament(false) }, 15000);
-  // o plano grátis do Render dorme sem acessos; o próprio robô se acessa a cada 10 min
-  const ext = process.env.RENDER_EXTERNAL_URL;
-  if (ext) setInterval(() => fetch(ext + '/health').catch(() => { }), 10 * 60e3);
 }
 process.on('SIGTERM', async () => { try { await save(true) } finally { process.exit(0) } });
 boot();
