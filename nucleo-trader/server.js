@@ -17,11 +17,15 @@ const META = {
 };
 const SYMBOLS = (process.env.SYMBOLS || 'BTCBRL,USDTBRL,ETHBRL').split(',').map(s => s.trim().toUpperCase()).filter(s => META[s]);
 const PORT = +process.env.PORT || 10000;
+const MODE_ID = E.MODES[process.env.MODE] ? process.env.MODE : 'v1';
+const MODE = E.MODES[MODE_ID];
+const LIVE_TFS = MODE.trend && !MODE.tfs.includes('1h') ? [...MODE.tfs, '1h'] : MODE.tfs;
+const FAST = MODE.tfs[0];   // tempo mais curto: dá o preço ao vivo e o ritmo do torneio
 const CFG = {
   cap: +(process.env.CAPITAL || 10000),
   lev: +(process.env.LEVERAGE || 1),
-  costPct: +(process.env.FEE_PCT || 0.1),          // taxa por lado, em %
-  evalMs: +(process.env.EVAL_SECONDS || 60) * 1000,
+  costPct: MODE.feePct,                            // taxa por lado, em %
+  evalMs: +(process.env.EVAL_SECONDS || MODE.evalS) * 1000,
   always: process.env.ALWAYS === '1',
 };
 const COST = CFG.costPct / 100;
@@ -76,7 +80,7 @@ function createBot(SYMBOL) {
   const S = {
     candles: {}, price: null, lastTick: 0, ranking: [], active: null, pending: null,
     votes: null, bias: 0, lastTour: 0, startedAt: Date.now(), acc: null, logs: [], reports: [],
-    win: null, dataOk: false, lastErr: null, ready: false,
+    win: null, dataOk: false, lastErr: null, ready: false, archive: [],
   };
   const freshAcc = () => ({ start: CFG.cap, bal: CFG.cap, pos: null, trades: [], eqHist: [], peak: CFG.cap, mdd: 0, fees: 0 });
   const fmtPx = v => v == null ? '—' : nf(v, M.prec);
@@ -95,7 +99,7 @@ function createBot(SYMBOL) {
     if (!force && Date.now() - lastSave < 30000) return;
     saving = true;
     try {
-      const data = { v: 1, startedAt: S.startedAt, acc: S.acc, logs: S.logs.slice(0, 200), reports: S.reports, win: S.win };
+      const data = { v: 1, mode: MODE_ID, startedAt: S.startedAt, acc: S.acc, logs: S.logs.slice(0, 200), reports: S.reports, win: S.win, archive: S.archive };
       await redis.set(KEY, JSON.stringify(data)); lastSave = Date.now();
     } catch (e) { console.error('save:', e.message) }
     saving = false;
@@ -104,7 +108,16 @@ function createBot(SYMBOL) {
   async function init() {
     let st = null;
     if (redis) try { const s = await redis.get(KEY); st = s ? JSON.parse(s) : null } catch (e) { console.error('load:', e.message) }
-    if (st && st.acc) {
+    if (st && st.acc && (st.mode || 'v1') !== MODE_ID) {
+      // nova versão do robô: guarda o resultado do teste anterior e começa um teste novo, do zero
+      const a = st.acc, px0 = a.eqHist && a.eqHist.length ? a.eqHist[0][2] : null, px1 = a.eqHist && a.eqHist.length ? a.eqHist[a.eqHist.length - 1][2] : null, eqv = a.bal + (a.pos && px1 ? a.pos.dir * (px1 - a.pos.entry) * a.pos.qty : 0);
+      S.archive = (st.archive || []).concat([{ mode: st.mode || 'v1', inicio: st.startedAt, fim: Date.now(), start: a.start, eq: eqv, ret: eqv / a.start - 1, trades: a.trades.length, wins: a.trades.filter(t => t.net > 0).length, fees: a.fees || 0, mdd: a.mdd, hold: px0 && px1 ? px1 / px0 - 1 : null, dias: st.reports ? st.reports.length : 0 }]);
+      S.logs = st.logs || [];
+      S.acc = freshAcc();
+      const ar = S.archive[S.archive.length - 1];
+      log(`Teste da ${ar.mode} encerrado e guardado: ${pct(ar.ret)} em ${ar.trades} operações (taxas ${brl(ar.fees)}). Começo um teste novo de 7 dias com a ${MODE.nome}, com ${brl(CFG.cap)} simulados.`, 'k');
+    } else if (st && st.acc) {
+      S.archive = st.archive || [];
       S.startedAt = st.startedAt; S.acc = st.acc; S.logs = st.logs || []; S.reports = st.reports || []; S.win = st.win || null;
       if (S.acc.fees == null) S.acc.fees = 0;
       log(`Servidor reiniciado: retomei a conta (${brl(S.acc.bal)} de saldo, ${S.acc.trades.length} operações, dia ${S.reports.length + 1}).`, 'k');
@@ -115,16 +128,16 @@ function createBot(SYMBOL) {
   }
   async function loadHistory() {
     const out = {};
-    for (const tf of E.TFS) {
-      const d = await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=${tf.id}&limit=${HIST}`);
-      out[tf.id] = d.map(toC);
+    for (const tf of LIVE_TFS) {
+      const d = await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=${tf}&limit=${HIST}`);
+      out[tf] = d.map(toC);
     }
     S.candles = out;
   }
   function afterHistory(first) {
-    const one = S.candles['1m']; S.price = one[one.length - 1].c; S.lastTick = Date.now(); S.dataOk = true;
+    const one = S.candles[FAST]; S.price = one[one.length - 1].c; S.lastTick = Date.now(); S.dataOk = true;
     if (!first) return;
-    log(`Histórico carregado: ${E.TFS.map(t => S.candles[t.id].length + '×' + t.id).join(', ')}.`);
+    log(`Histórico carregado: ${LIVE_TFS.map(t => S.candles[t].length + '×' + t).join(', ')}.`);
     if (!S.win) S.win = newWindow(S.startedAt);
     if (!S.acc.eqHist.length) S.acc.eqHist.push([Date.now(), S.acc.bal, S.price]);
     runTournament(true);
@@ -143,18 +156,18 @@ function createBot(SYMBOL) {
     else if (!last || c.t > last.t) { arr.push(c); if (arr.length > MAXC) arr.shift() }
     else return;
     S.dataOk = true; S.lastErr = null;
-    if (tf === '1m') tick(c.c);
+    if (tf === FAST) tick(c.c);
     if (k.x) candleClosed(tf, arr.length - 1);
   }
 
   /* ---- cérebro ---- */
   function rowOf(r) { return r && { key: r.key, tf: r.tf, nome: r.st.nome, fam: r.st.fam, f: r.st.f || null, risco: r.rk.nome, perDay: r.perDay, win: r.win, trades: r.trades, mdd: r.mdd, score: r.score } }
   function runTournament(reason) {
-    const t0 = Date.now(); const res = E.tournament(S.candles, COST);
+    const t0 = Date.now(); const res = E.tournament(S.candles, COST, { tfs: MODE.tfs, longOnly: MODE.longOnly, oos: MODE.oos, allowLong: MODE.trend ? E.makeTrend(S.candles['1h']) : null });
     S.ranking = res; S.lastTour = Date.now();
     const best = res[0]; if (!best) return;
     const ok = best.score > 0 || CFG.always;
-    if (reason) log(`Torneio: testei ${res.length} combinações (${E.STRATS.length} estratégias × ${E.TFS.length} tempos × ${E.RISKS.length} perfis de stop) em ${Date.now() - t0} ms.`);
+    if (reason) log(`Torneio: testei ${res.length} combinações (${E.STRATS.length} estratégias × ${MODE.tfs.length} tempos × ${E.RISKS.length} perfis de stop) em ${Date.now() - t0} ms.`);
     const cur = S.active && S.active.key;
     if (!ok) {
       if (S.active && !S.acc.pos) { log(`Nenhuma estratégia está ganhando depois das taxas. Melhor: ${best.st.nome} em ${best.tf} com ${pct(best.perDay, 3)}/dia. Fico de fora.`, 'w'); S.active = null }
@@ -178,12 +191,18 @@ function createBot(SYMBOL) {
     return parts.join(' · ');
   }
   function candleClosed(tf, idx) {
-    if (tf === '1m' && Date.now() - S.lastTour >= CFG.evalMs) runTournament(true);
-    if (tf === '1m') updateVotes();
+    if (tf === FAST && Date.now() - S.lastTour >= CFG.evalMs) runTournament(true);
+    if (tf === FAST) updateVotes();
     const act = S.active; if (!act || act.tf !== tf || S.price == null) return;
-    const c = S.candles[tf], I = E.makeInd(c), s = act.st.sig(I, idx), a = S.acc, px = S.price;
+    const c = S.candles[tf], I = E.makeInd(c), a = S.acc, px = S.price;
+    let s = act.st.sig(I, idx);
     const tag = `${act.st.nome} (${tf})`;
     if (s === null) return;
+    if (MODE.longOnly && s === -1) s = 0;          // à vista na Binance não dá para vender a descoberto: sinal de venda = sair para o caixa
+    if (s === 1 && MODE.trend && !a.pos && !E.makeTrend(S.candles['1h'])(c[idx].t + E.TFMS[tf])) {
+      if (Date.now() - (S.lastTrendLog || 0) > 3600e3) { S.lastTrendLog = Date.now(); log(`Sinal de compra de ${tag} ignorado: o 1h está abaixo da média de 200 (tendência de baixa).`, 'w') }
+      return;
+    }
     if (s === 0) { if (a.pos) closePos(px, 'sinal de saída de ' + tag); return }
     if (a.pos && a.pos.dir === s) return;
     if (a.pos) closePos(px, 'sinal contrário de ' + tag);
@@ -255,6 +274,7 @@ function createBot(SYMBOL) {
   function reportText() {
     const a = S.acc, eq = equity(), days = (Date.now() - S.startedAt) / DAY, L = [];
     L.push(`=== ${M.nome} (${SYMBOL}) ===`);
+    for (const ar of S.archive) L.push(`Teste anterior (${ar.mode}, ${quando(ar.inicio)} → ${quando(ar.fim)}): ${pct(ar.ret)} em ${ar.trades} operações, taxas ${brl(ar.fees)}, ${M.curto} parado ${ar.hold == null ? '—' : pct(ar.hold)}.`);
     L.push(`Rodando desde ${quando(S.startedAt)} (${nf(days, 1)} dias, dia ${Math.floor(days) + 1} do teste). Dados ${S.dataOk ? 'ao vivo' : 'COM FALHA: ' + (S.lastErr || '')}. Último preço ${fmtPx(S.price)} às ${quando(S.lastTick)}.`);
     L.push(`Patrimônio ${brl(eq)} · resultado total ${pct(eq / a.start - 1)} (${brl(eq - a.start)}) · ${a.trades.length} operações · acerto ${a.trades.length ? nf(a.trades.filter(t => t.net > 0).length / a.trades.length * 100, 0) + '%' : '—'} · taxas pagas ${brl(a.fees)} · maior queda ${nf(a.mdd * 100, 2)}%.`);
     const h = holdPct(); if (h != null) L.push(`Comparação: ${M.curto} parado no mesmo período ${pct(h)}.`);
@@ -277,7 +297,7 @@ function createBot(SYMBOL) {
     const a = S.acc, eq = equity(), h = a.eqHist, step = Math.max(1, Math.ceil(h.length / 400));
     const eqHist = h.filter((_, i) => i % step === 0 || i === h.length - 1).map(x => [x[0], x[1], x[2]]);
     return {
-      symbol: SYMBOL, meta: M, now: Date.now(), startedAt: S.startedAt, bootAt: BOOT, cfg: { cap: CFG.cap, lev: CFG.lev, costPct: CFG.costPct, evalS: CFG.evalMs / 1000 },
+      symbol: SYMBOL, meta: M, now: Date.now(), startedAt: S.startedAt, bootAt: BOOT, cfg: { cap: CFG.cap, lev: CFG.lev, costPct: CFG.costPct, evalS: CFG.evalMs / 1000, mode: MODE_ID, modeNome: MODE.nome, tfs: MODE.tfs }, archive: S.archive,
       price: S.price, lastTick: S.lastTick, ch24: ch24(), dataOk: S.dataOk, lastErr: S.lastErr, estado: estado(),
       active: rowOf(S.active), pending: rowOf(S.pending), votes: S.votes, votesTf: S.votesTf, bias: S.bias,
       ranking: S.ranking.slice(0, 12).map(rowOf), combos: S.ranking.length, lastTour: S.lastTour,
@@ -301,7 +321,7 @@ async function loadAllHistory() { for (const b of list()) await b.loadHistory() 
 const WSS = process.env.WS_URL ? [process.env.WS_URL] : ['wss://data-stream.binance.vision/stream?streams=', 'wss://stream.binance.com:9443/stream?streams='];
 let ws = null, wsIdx = 0, lastMsg = 0, reconnecting = false, warned = false;
 function connectWS() {
-  const streams = SYMBOLS.flatMap(s => E.TFS.map(t => s.toLowerCase() + '@kline_' + t.id)).join('/');
+  const streams = SYMBOLS.flatMap(s => LIVE_TFS.map(t => s.toLowerCase() + '@kline_' + t)).join('/');
   const url = WSS[wsIdx % WSS.length] + streams;
   let me;
   try { me = ws = new WebSocket(url) } catch (e) { return scheduleReconnect('erro ao abrir a conexão: ' + e.message) }
@@ -343,11 +363,53 @@ setInterval(() => {
   }
 }, 15000);
 
+/* ---------------- laboratório: compara as versões nos últimos dias reais ---------------- */
+const { Worker } = require('worker_threads');
+const LAB = { status: 'parado', startedAt: null, finishedAt: null, results: null, error: null, period: null };
+async function fetchRange(sym, tf, total) {
+  let out = [], end = Date.now();
+  while (out.length < total) {
+    const d = await fetchJSON(`/api/v3/klines?symbol=${sym}&interval=${tf}&limit=${Math.min(1000, total - out.length)}&endTime=${end}`);
+    if (!d.length) break;
+    out = d.map(toC).concat(out); end = d[0][0] - 1;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return out;
+}
+async function runLab(days) {
+  LAB.status = 'baixando dados'; LAB.startedAt = Date.now(); LAB.error = null;
+  try {
+    const now = Date.now(), H = 3600e3, testEnd = Math.floor(now / H) * H, testStart = testEnd - days * 864e5, data = {};
+    for (const sym of SYMBOLS) {
+      data[sym] = {};
+      for (const tf of ['1m', '3m', '5m', '15m', '1h', '4h']) data[sym][tf] = await fetchRange(sym, tf, 520 + Math.ceil((now - testStart) / E.TFMS[tf]) + 2);
+    }
+    LAB.status = 'simulando';
+    LAB.results = await new Promise((res, rej) => {
+      const w = new Worker(path.join(__dirname, 'lab.js'), { workerData: { data, modes: Object.keys(E.MODES), testStart, testEnd, step: H } });
+      w.once('message', res); w.once('error', rej); w.once('exit', c => { if (c) rej(new Error('simulação parou com código ' + c)) });
+    });
+    LAB.period = { testStart, testEnd, days }; LAB.status = 'pronto'; LAB.finishedAt = Date.now();
+  } catch (e) { LAB.status = 'erro'; LAB.error = e.message; console.error('lab:', e) }
+}
+function labText() {
+  if (LAB.status !== 'pronto') return `Laboratório: ${LAB.status}${LAB.error ? ' (' + LAB.error + ')' : ''}${LAB.startedAt ? ', iniciado ' + quando(LAB.startedAt) : ''}. Abra /lab?run=1 para rodar.`;
+  const L = [`LABORATÓRIO — robô inteiro reproduzido de ${quando(LAB.period.testStart)} a ${quando(LAB.period.testEnd)} (${LAB.period.days} dias), escolhendo a estratégia a cada hora só com o passado. R$ 10.000 por ativo.`, ''];
+  for (const id of Object.keys(E.MODES)) L.push(`${id}: ${E.MODES[id].nome}`);
+  for (const sym of Object.keys(LAB.results)) {
+    L.push('', `=== ${META[sym].nome} (${sym}) — ativo parado no período: ${pct(Object.values(LAB.results[sym])[0].hold)} ===`);
+    for (const [id, r] of Object.entries(LAB.results[sym])) L.push(`${id}: resultado ${pct(r.ret)} (${brl(r.ret * CFG.cap)}) · ${r.trades} operações · acerto ${r.win == null ? '—' : nf(r.win * 100, 0) + '%'} · taxas ${brl(r.fees * CFG.cap)} · maior queda ${nf(r.mdd * 100, 2)}% · posicionado ${nf(r.inMkt * 100, 0)}% do tempo · ${r.estrategias} estratégias diferentes usadas`);
+  }
+  const tot = {}; for (const sym of Object.keys(LAB.results)) for (const [id, r] of Object.entries(LAB.results[sym])) tot[id] = (tot[id] || 0) + r.ret;
+  L.push('', 'Carteira somada (3 ativos): ' + Object.entries(tot).map(([id, v]) => `${id} ${pct(v / Object.keys(LAB.results).length)}`).join(' · '));
+  return L.join('\n');
+}
+
 /* ---------------- API ---------------- */
 function fullReport() {
   const all = list(), eq = all.reduce((s, b) => s + (b.S.acc ? b.equity() : CFG.cap), 0), cap = all.length * CFG.cap;
   const L = [`NÚCLEO TRADER — relatório (dinheiro simulado, ${all.length} ativos com ${brl(CFG.cap)} cada)`,
-    `Configuração: alavancagem ${CFG.lev}x, taxa ${nf(CFG.costPct, 2)}% por lado. Carteira somada: ${brl(eq)} de ${brl(cap)} (${pct(eq / cap - 1)}).`, ''];
+    `Versão do robô: ${MODE.nome}. Configuração: alavancagem ${CFG.lev}x, taxa ${nf(CFG.costPct, 3)}% por lado. Carteira somada: ${brl(eq)} de ${brl(cap)} (${pct(eq / cap - 1)}).`, ''];
   for (const b of all) { if (b.S.acc) { L.push(b.reportText()); L.push('') } }
   return L.join('\n');
 }
@@ -363,6 +425,12 @@ const server = http.createServer((req, res) => {
     if (u.pathname === '/api/state') { const b = bot(); if (!b || !b.S.acc) return json({ error: 'ativo indisponível' }, 404); return json(b.statePayload()) }
     if (u.pathname === '/api/candles') { const b = bot(), tf = u.searchParams.get('tf') || '5m'; const c = b && b.S.candles[tf]; if (!c) return json({ error: 'ativo ou tempo inválido' }, 400); return json({ tf, candles: c.slice(-300) }) }
     if (u.pathname === '/api/report') return json({ assets: list().filter(b => b.S.acc).map(b => ({ symbol: b.SYMBOL, reports: b.S.reports, parcial: b.S.win ? b.summarize(b.S.win, Date.now()) : null })), texto: fullReport() });
+    if (u.pathname === '/lab' || u.pathname === '/api/lab') {
+      const busy = LAB.status === 'baixando dados' || LAB.status === 'simulando';
+      if (u.searchParams.get('run') && !busy && (!LAB.finishedAt || Date.now() - LAB.finishedAt > 10 * 60e3)) runLab(Math.min(7, Math.max(1, +u.searchParams.get('dias') || 4)));
+      if (u.pathname === '/api/lab') return json({ ...LAB, texto: labText() });
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); return res.end(labText());
+    }
     if (u.pathname === '/relatorio') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); return res.end(fullReport()) }
     const f = files[u.pathname];
     if (f) { res.writeHead(200, { 'content-type': f[1], 'cache-control': f[2] }); return fs.createReadStream(path.join(PUB, f[0])).pipe(res) }

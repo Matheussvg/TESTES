@@ -3,8 +3,19 @@
 
 const TFS = [
   { id: '1m', ms: 60e3 }, { id: '3m', ms: 180e3 }, { id: '5m', ms: 300e3 },
-  { id: '15m', ms: 900e3 }, { id: '1h', ms: 3600e3 },
+  { id: '15m', ms: 900e3 }, { id: '1h', ms: 3600e3 }, { id: '4h', ms: 14400e3 },
 ];
+const TFMS = Object.fromEntries(TFS.map(t => [t.id, t.ms]));
+
+// Versões do robô. v1 = a original. As outras atacam o que os relatórios mostraram:
+// operar demais em gráfico curto (taxa come tudo), vender a descoberto num mercado em alta
+// e escolher estratégia "sortuda" no histórico (sobreajuste).
+const MODES = {
+  v1: { nome: 'v1 original', tfs: ['1m', '3m', '5m', '15m', '1h'], longOnly: false, trend: false, oos: false, feePct: 0.1, evalS: 60 },
+  v2: { nome: 'v2 só compra, sem 1m/3m, validação fora da amostra', tfs: ['5m', '15m', '1h', '4h'], longOnly: true, trend: false, oos: true, feePct: 0.1, evalS: 3600 },
+  v3: { nome: 'v3 = v2 + filtro de tendência (EMA 200 do 1h)', tfs: ['5m', '15m', '1h', '4h'], longOnly: true, trend: true, oos: true, feePct: 0.1, evalS: 3600 },
+  v4: { nome: 'v4 = v3 com taxa paga em BNB (0,075%)', tfs: ['5m', '15m', '1h', '4h'], longOnly: true, trend: true, oos: true, feePct: 0.075, evalS: 3600 },
+};
 const RISKS = [
   { id: 'c', nome: 'stop curto', sl: 1.5, tp: 2.0 },
   { id: 'l', nome: 'stop longo', sl: 2.5, tp: 5.0 },
@@ -59,40 +70,66 @@ const STRATS = [
   { id: 'cons', nome: 'Consenso de indicadores', fam: 'votação', sig: (I, i) => { const v = votes(I, i); const a = (v.tend + v.mom + v.forca + v.bandas + v.romp) / 5; if (a > 0.55) return 1; if (a < -0.55) return -1; if (Math.abs(a) < 0.12) return 0; return null } },
 ];
 
-function backtest(c, st, risk, cost) {
-  const n = c.length; if (n < WARM + 30) return null;
-  const I = makeInd(c), atr = I.atr(14);
+// Filtro de tendência: só compra quando o último candle FECHADO de 1h está acima da EMA 200 do 1h.
+function makeTrend(c1h, I1h) {
+  if (!c1h || c1h.length < 210) return () => true;
+  const I = I1h || makeInd(c1h), e = I.ema(200), H = 3600e3;
+  return t => {
+    let lo = 0, hi = c1h.length - 1, k = -1;               // último candle com fechamento <= t
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (c1h[m].t + H <= t) { k = m; lo = m + 1 } else hi = m - 1 }
+    return k >= 0 && Number.isFinite(e[k]) && c1h[k].c > e[k];
+  };
+}
+
+// o = { I, from, to, longOnly, allowLong, ms }
+function backtest(c, st, risk, cost, o = {}) {
+  const to = o.to == null ? c.length : o.to, from = Math.max(WARM, o.from == null ? WARM : o.from);
+  if (to - from < 30) return null;
+  const I = o.I || makeInd(c), atr = I.atr(14), ms = o.ms || 0;
   let eq = 1, peak = 1, mdd = 0, pos = 0, entry = 0, sl = 0, tp = 0, trades = 0, wins = 0;
   const close = px => { const r = pos * (px - entry) / entry; eq *= (1 + r) * (1 - cost); trades++; if (r > cost * 2) wins++; pos = 0; if (eq > peak) peak = eq; const dd = 1 - eq / peak; if (dd > mdd) mdd = dd };
-  for (let i = WARM; i < n - 1; i++) {
+  for (let i = from; i < to - 1; i++) {
     if (pos) {
       const b = c[i]; let x = null;
       if (pos > 0) { if (b.l <= sl) x = sl; else if (b.h >= tp) x = tp } else { if (b.h >= sl) x = sl; else if (b.l <= tp) x = tp }
       if (x !== null) close(x);
     }
-    const s = st.sig(I, i); if (s === null) continue;
+    let s = st.sig(I, i); if (s === null) continue;
+    if (o.longOnly && s === -1) s = 0;
+    if (s === 1 && o.allowLong && !pos && !o.allowLong(c[i].t + ms)) continue;
     const px = c[i + 1].o;
     if (s === 0) { if (pos) close(px) }
     else if (s !== pos) { if (pos) close(px); const a = atr[i]; if (!(a > 0)) continue; pos = s; entry = px; eq *= (1 - cost); sl = px - s * risk.sl * a; tp = px + s * risk.tp * a }
   }
-  if (pos) close(c[n - 1].c);
-  const days = Math.max((c[n - 1].t - c[WARM].t) / 864e5, 1 / 24);
+  if (pos) close(c[to - 1].c);
+  const days = Math.max((c[to - 1].t - c[from].t) / 864e5, 1 / 24);
   const perDay = eq > 0 ? Math.pow(eq, 1 / days) - 1 : -1;
   const score = trades < 3 ? -999 : perDay * 100 - 0.1 * mdd * 100;
   return { ret: eq - 1, perDay, mdd, trades, win: trades ? wins / trades : 0, days, score };
 }
 
-function tournament(candles, cost) {
-  const res = [];
-  for (const tf of TFS) {
-    const c = candles[tf.id]; if (!c || c.length < WARM + 30) continue;
+// o = { tfs, longOnly, allowLong, oos, Is: {tf: I}, ranges: {tf: {from, to}} }
+function tournament(candles, cost, o = {}) {
+  const res = [], tfs = o.tfs || TFS.slice(0, 5).map(t => t.id);
+  for (const tf of tfs) {
+    const c = candles[tf]; if (!c) continue;
+    const r = (o.ranges && o.ranges[tf]) || { from: Math.max(0, c.length - 500), to: c.length };
+    if (r.to - Math.max(WARM, r.from) < 60) continue;
+    const I = (o.Is && o.Is[tf]) || makeInd(c);
+    const base = { I, from: r.from, to: r.to, longOnly: o.longOnly, allowLong: o.allowLong, ms: TFMS[tf] };
+    const split = r.to - Math.floor((r.to - Math.max(WARM, r.from)) * 0.3);
     for (const st of STRATS) for (const rk of RISKS) {
-      const r = backtest(c, st, rk, cost);
-      if (r) res.push({ key: tf.id + '|' + st.id + '|' + rk.id, tf: tf.id, st, rk, ...r });
+      const full = backtest(c, st, rk, cost, base); if (!full) continue;
+      let score = full.score, oos = null;
+      if (o.oos) {   // validação: precisa ir bem no histórico todo E nos últimos 30% que ela "não viu" sozinha
+        oos = backtest(c, st, rk, cost, { ...base, from: split });
+        score = (full.trades < 6 || !oos || oos.trades < 2) ? -999 : Math.min(full.perDay, oos.perDay) * 100 - 0.1 * full.mdd * 100;
+      }
+      res.push({ key: tf + '|' + st.id + '|' + rk.id, tf, st, rk, ...full, score, oos: oos && { perDay: oos.perDay, trades: oos.trades } });
     }
   }
   res.sort((a, b) => b.score - a.score);
   return res;
 }
 
-module.exports = { TFS, RISKS, STRATS, WARM, makeInd, votes, backtest, tournament };
+module.exports = { TFS, TFMS, MODES, RISKS, STRATS, WARM, makeInd, makeTrend, votes, backtest, tournament };
