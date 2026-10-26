@@ -1,12 +1,21 @@
 'use strict';
-// Núcleo Trader — robô de trade simulado rodando 24h no servidor.
+// Núcleo Trader — robô de trade simulado rodando 24h no servidor, em vários ativos.
 // Lê preços reais da Binance, escolhe a melhor estratégia por torneio e opera com dinheiro fictício.
+// Cada ativo tem sua própria conta simulada, seu próprio torneio e seus próprios relatórios de 24h.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const E = require('./engine');
 
-const SYMBOL = process.env.SYMBOL || 'BTCBRL';
+const META = {
+  BTCBRL: { nome: 'Bitcoin', curto: 'BTC', prec: 0 },
+  USDTBRL: { nome: 'Dólar digital (USDT)', curto: 'DÓLAR', prec: 3 },
+  ETHBRL: { nome: 'Ethereum', curto: 'ETH', prec: 0 },
+  SOLBRL: { nome: 'Solana', curto: 'SOL', prec: 2 },
+  BNBBRL: { nome: 'BNB', curto: 'BNB', prec: 1 },
+  XRPBRL: { nome: 'XRP', curto: 'XRP', prec: 3 },
+};
+const SYMBOLS = (process.env.SYMBOLS || 'BTCBRL,USDTBRL,ETHBRL').split(',').map(s => s.trim().toUpperCase()).filter(s => META[s]);
 const PORT = +process.env.PORT || 10000;
 const CFG = {
   cap: +(process.env.CAPITAL || 10000),
@@ -18,32 +27,16 @@ const CFG = {
 const COST = CFG.costPct / 100;
 const REST = process.env.DATA_URL ? [process.env.DATA_URL] : ['https://data-api.binance.vision', 'https://api.binance.com', 'https://api1.binance.com', 'https://api3.binance.com'];
 const HIST = 500, MAXC = 700, DAY = 864e5;
-const KEY = 'nt:state:' + SYMBOL;
 const TZ = 'America/Sao_Paulo';
-
-/* ---------------- estado ---------------- */
-const S = {
-  candles: {}, price: null, lastTick: 0, ranking: [], active: null, pending: null,
-  votes: null, bias: 0, lastTour: 0, startedAt: Date.now(), acc: null, logs: [], reports: [],
-  win: null, dataOk: false, bootAt: Date.now(), lastErr: null,
-};
-const freshAcc = () => ({ start: CFG.cap, bal: CFG.cap, pos: null, trades: [], eqHist: [], peak: CFG.cap, mdd: 0, fees: 0 });
+const BOOT = Date.now();
 
 const nf = (v, d) => Number(v).toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d });
 const brl = v => Number(v).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 const pct = (v, d = 2) => (v >= 0 ? '+' : '') + nf(v * 100, d) + '%';
-const fmtPx = v => v == null ? '—' : nf(v, 0);
 const quando = t => new Date(t).toLocaleString('pt-BR', { timeZone: TZ, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 
-function log(msg, cls = '') {
-  S.logs.unshift({ t: Date.now(), msg, cls });
-  if (S.logs.length > 300) S.logs.length = 300;
-  console.log(new Date().toISOString(), msg);
-}
-function equity(p = S.price) { const a = S.acc; if (!a.pos || p == null) return a.bal; return a.bal + a.pos.dir * (p - a.pos.entry) * a.pos.qty }
-
 /* ---------------- persistência (Render Key Value) ---------------- */
-let redis = null, saving = false, again = false, lastSave = 0;
+let redis = null;
 async function initRedis() {
   const url = process.env.REDIS_URL;
   if (!url) { console.log('Sem REDIS_URL: estado só em memória.'); return }
@@ -54,24 +47,8 @@ async function initRedis() {
     await redis.connect();
   } catch (e) { console.error('redis indisponível:', e.message); redis = null }
 }
-async function loadState() {
-  if (!redis) return null;
-  try { const s = await redis.get(KEY); return s ? JSON.parse(s) : null } catch (e) { console.error('load:', e.message); return null }
-}
-async function save(force) {
-  if (!redis) return;
-  if (saving) { if (force) again = true; return }
-  if (!force && Date.now() - lastSave < 30000) return;
-  saving = true;
-  try {
-    const data = { v: 1, startedAt: S.startedAt, acc: S.acc, logs: S.logs.slice(0, 200), reports: S.reports, win: S.win };
-    await redis.set(KEY, JSON.stringify(data)); lastSave = Date.now();
-  } catch (e) { console.error('save:', e.message) }
-  saving = false;
-  if (again) { again = false; save(true) }
-}
 
-/* ---------------- dados de mercado ---------------- */
+/* ---------------- dados de mercado (REST só para histórico) ---------------- */
 const toC = k => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] });
 let cooldownUntil = 0;
 async function fetchJSON(p) {
@@ -92,27 +69,250 @@ async function fetchJSON(p) {
   }
   throw err;
 }
-async function loadHistory() {
-  const out = {};
-  for (const tf of E.TFS) {
-    const d = await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=${tf.id}&limit=${HIST}`);
-    out[tf.id] = d.map(toC);
+
+/* ================= um robô por ativo ================= */
+function createBot(SYMBOL) {
+  const M = META[SYMBOL], KEY = 'nt:state:' + SYMBOL;
+  const S = {
+    candles: {}, price: null, lastTick: 0, ranking: [], active: null, pending: null,
+    votes: null, bias: 0, lastTour: 0, startedAt: Date.now(), acc: null, logs: [], reports: [],
+    win: null, dataOk: false, lastErr: null, ready: false,
+  };
+  const freshAcc = () => ({ start: CFG.cap, bal: CFG.cap, pos: null, trades: [], eqHist: [], peak: CFG.cap, mdd: 0, fees: 0 });
+  const fmtPx = v => v == null ? '—' : nf(v, M.prec);
+
+  function log(msg, cls = '') {
+    S.logs.unshift({ t: Date.now(), msg, cls });
+    if (S.logs.length > 300) S.logs.length = 300;
+    console.log(new Date().toISOString(), '[' + M.curto + ']', msg);
   }
-  S.candles = out;
+  function equity(p = S.price) { const a = S.acc; if (!a.pos || p == null) return a.bal; return a.bal + a.pos.dir * (p - a.pos.entry) * a.pos.qty }
+
+  let saving = false, again = false, lastSave = 0;
+  async function save(force) {
+    if (!redis || !S.acc) return;
+    if (saving) { if (force) again = true; return }
+    if (!force && Date.now() - lastSave < 30000) return;
+    saving = true;
+    try {
+      const data = { v: 1, startedAt: S.startedAt, acc: S.acc, logs: S.logs.slice(0, 200), reports: S.reports, win: S.win };
+      await redis.set(KEY, JSON.stringify(data)); lastSave = Date.now();
+    } catch (e) { console.error('save:', e.message) }
+    saving = false;
+    if (again) { again = false; save(true) }
+  }
+  async function init() {
+    let st = null;
+    if (redis) try { const s = await redis.get(KEY); st = s ? JSON.parse(s) : null } catch (e) { console.error('load:', e.message) }
+    if (st && st.acc) {
+      S.startedAt = st.startedAt; S.acc = st.acc; S.logs = st.logs || []; S.reports = st.reports || []; S.win = st.win || null;
+      if (S.acc.fees == null) S.acc.fees = 0;
+      log(`Servidor reiniciado: retomei a conta (${brl(S.acc.bal)} de saldo, ${S.acc.trades.length} operações, dia ${S.reports.length + 1}).`, 'k');
+    } else {
+      S.acc = freshAcc();
+      log(`Robô iniciado em ${M.nome} (${SYMBOL}) com ${brl(CFG.cap)} simulados · alavancagem ${CFG.lev}x · taxa ${nf(CFG.costPct, 2)}% por lado (igual à Binance).`, 'k');
+    }
+  }
+  async function loadHistory() {
+    const out = {};
+    for (const tf of E.TFS) {
+      const d = await fetchJSON(`/api/v3/klines?symbol=${SYMBOL}&interval=${tf.id}&limit=${HIST}`);
+      out[tf.id] = d.map(toC);
+    }
+    S.candles = out;
+  }
+  function afterHistory(first) {
+    const one = S.candles['1m']; S.price = one[one.length - 1].c; S.lastTick = Date.now(); S.dataOk = true;
+    if (!first) return;
+    log(`Histórico carregado: ${E.TFS.map(t => S.candles[t.id].length + '×' + t.id).join(', ')}.`);
+    if (!S.win) S.win = newWindow(S.startedAt);
+    if (!S.acc.eqHist.length) S.acc.eqHist.push([Date.now(), S.acc.bal, S.price]);
+    runTournament(true);
+    if (S.acc.pos) {
+      const r = S.ranking.find(x => x.key === S.acc.pos.key);
+      if (r) S.active = r;
+      log(`Retomei a posição aberta de ${S.acc.pos.dir > 0 ? 'compra' : 'venda'} a ${fmtPx(S.acc.pos.entry)}.`, 'k');
+    }
+    updateVotes(); save(true); S.ready = true;
+  }
+  function onKline(k) {
+    if (!S.ready) return;
+    const tf = k.i, arr = S.candles[tf]; if (!arr) return;
+    const c = { t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v }, last = arr[arr.length - 1];
+    if (last && last.t === c.t) arr[arr.length - 1] = c;
+    else if (!last || c.t > last.t) { arr.push(c); if (arr.length > MAXC) arr.shift() }
+    else return;
+    S.dataOk = true; S.lastErr = null;
+    if (tf === '1m') tick(c.c);
+    if (k.x) candleClosed(tf, arr.length - 1);
+  }
+
+  /* ---- cérebro ---- */
+  function rowOf(r) { return r && { key: r.key, tf: r.tf, nome: r.st.nome, fam: r.st.fam, f: r.st.f || null, risco: r.rk.nome, perDay: r.perDay, win: r.win, trades: r.trades, mdd: r.mdd, score: r.score } }
+  function runTournament(reason) {
+    const t0 = Date.now(); const res = E.tournament(S.candles, COST);
+    S.ranking = res; S.lastTour = Date.now();
+    const best = res[0]; if (!best) return;
+    const ok = best.score > 0 || CFG.always;
+    if (reason) log(`Torneio: testei ${res.length} combinações (${E.STRATS.length} estratégias × ${E.TFS.length} tempos × ${E.RISKS.length} perfis de stop) em ${Date.now() - t0} ms.`);
+    const cur = S.active && S.active.key;
+    if (!ok) {
+      if (S.active && !S.acc.pos) { log(`Nenhuma estratégia está ganhando depois das taxas. Melhor: ${best.st.nome} em ${best.tf} com ${pct(best.perDay, 3)}/dia. Fico de fora.`, 'w'); S.active = null }
+      else if (!S.active && reason) log(`Nenhuma estratégia passou do zero depois das taxas (melhor: ${pct(best.perDay, 3)}/dia). Fico de fora e sigo observando.`, 'w');
+      if (S.acc.pos) S.pending = null;
+    } else if (best.key !== cur) {
+      if (S.acc.pos) { if (!S.pending || S.pending.key !== best.key) { S.pending = best; log(`Nova líder: ${best.st.nome} em ${best.tf}. Troco quando a posição atual fechar.`) } }
+      else { S.active = best; S.pending = null; log(`Assumo ${best.st.nome} no gráfico de ${best.tf} (${best.rk.nome}): ${pct(best.perDay, 3)}/dia no histórico, ${nf(best.win * 100, 0)}% de acerto em ${best.trades} operações.`, 'k') }
+    } else if (reason) log(`Mantenho ${best.st.nome} em ${best.tf}: segue na liderança com ${pct(best.perDay, 3)}/dia.`);
+    else S.active = best;
+  }
+  function updateVotes() {
+    const tf = S.active ? S.active.tf : '5m', c = S.candles[tf]; if (!c || c.length < E.WARM) return;
+    const I = E.makeInd(c); S.votes = E.votes(I, c.length - 1); S.votesTf = tf;
+    const v = S.votes; S.bias = (v.tend + v.mom + v.forca + v.bandas + v.romp) / 5;
+  }
+  function why(I, i, act, s) {
+    const v = E.votes(I, i), parts = ['RSI ' + nf(I.rsi(14)[i], 1), 'tendência ' + (v.tend > 0 ? 'de alta' : 'de baixa')];
+    if (act.st.fam === 'reversão') parts.push(s > 0 ? 'preço esticado para baixo' : 'preço esticado para cima');
+    if (act.st.fam === 'rompimento') parts.push(s > 0 ? 'rompeu a máxima recente' : 'perdeu a mínima recente');
+    return parts.join(' · ');
+  }
+  function candleClosed(tf, idx) {
+    if (tf === '1m' && Date.now() - S.lastTour >= CFG.evalMs) runTournament(true);
+    if (tf === '1m') updateVotes();
+    const act = S.active; if (!act || act.tf !== tf || S.price == null) return;
+    const c = S.candles[tf], I = E.makeInd(c), s = act.st.sig(I, idx), a = S.acc, px = S.price;
+    const tag = `${act.st.nome} (${tf})`;
+    if (s === null) return;
+    if (s === 0) { if (a.pos) closePos(px, 'sinal de saída de ' + tag); return }
+    if (a.pos && a.pos.dir === s) return;
+    if (a.pos) closePos(px, 'sinal contrário de ' + tag);
+    if (S.active !== act) return;
+    if (S.pending) { S.active = S.pending; S.pending = null; log(`Troco para ${S.active.st.nome} em ${S.active.tf}.`, 'k'); return }
+    const atr = I.atr(14)[idx]; if (!(atr > 0)) return;
+    openPos(s, px, atr, act, why(I, idx, act, s));
+  }
+  function openPos(dir, px, atr, act, reason) {
+    const a = S.acc, notional = equity(px) * CFG.lev, qty = notional / px, fee = notional * COST;
+    a.bal -= fee; a.fees += fee;
+    a.pos = { dir, entry: px, qty, sl: px - dir * act.rk.sl * atr, tp: px + dir * act.rk.tp * atr, t: Date.now(), strat: act.st.nome, tf: act.tf, key: act.key, fee };
+    log(`${dir > 0 ? 'COMPRA' : 'VENDA'} simulada a ${fmtPx(px)} · ${act.st.nome} (${act.tf}) · ${reason}. Stop ${fmtPx(a.pos.sl)}, alvo ${fmtPx(a.pos.tp)}.`, dir > 0 ? 'b' : 's');
+    save(true);
+  }
+  function closePos(px, reason) {
+    const a = S.acc, p = a.pos; if (!p) return;
+    const gross = p.dir * (px - p.entry) * p.qty, fee = px * p.qty * COST, net = gross - fee - p.fee;
+    a.bal += gross - fee; a.fees += fee;
+    a.trades.unshift({ dir: p.dir, entry: p.entry, exit: px, t0: p.t, t1: Date.now(), net, fees: fee + p.fee, strat: p.strat, tf: p.tf, reason });
+    if (a.trades.length > 2000) a.trades.length = 2000;
+    a.pos = null;
+    log(`Encerrei ${p.dir > 0 ? 'compra' : 'venda'} a ${fmtPx(px)} (${reason}): ${net >= 0 ? 'ganho' : 'perda'} de ${brl(Math.abs(net))} já com taxas.`, net >= 0 ? 'b' : 's');
+    if (S.pending) { S.active = S.pending; S.pending = null; log(`Agora assumo ${S.active.st.nome} em ${S.active.tf}.`, 'k') }
+    save(true);
+  }
+  function tick(px) {
+    S.price = px; S.lastTick = Date.now();
+    const a = S.acc, p = a.pos;
+    if (p) {
+      if (p.dir > 0 && px <= p.sl) closePos(px, 'stop'); else if (p.dir > 0 && px >= p.tp) closePos(px, 'alvo atingido');
+      else if (p.dir < 0 && px >= p.sl) closePos(px, 'stop'); else if (p.dir < 0 && px <= p.tp) closePos(px, 'alvo atingido');
+    }
+    const eq = equity(px); if (eq > a.peak) a.peak = eq; const dd = 1 - eq / a.peak; if (dd > a.mdd) a.mdd = dd;
+    const h = a.eqHist, now = Date.now();
+    if (!h.length || now - h[h.length - 1][0] >= 60000) { h.push([now, Math.round(eq * 100) / 100, px]); if (h.length > 15000) h.shift() }
+    trackWindow();
+    save();
+  }
+
+  /* ---- relatórios de 24h ---- */
+  function newWindow(start) { const eq = equity(); return { start, eq0: eq, px0: S.price, peak: eq, mdd: 0, inMkt: 0, lastT: Date.now() } }
+  function summarize(w, end) {
+    const eq = equity(), tr = S.acc.trades.filter(t => t.t1 >= w.start && t.t1 < end), wins = tr.filter(t => t.net > 0);
+    const est = {}; for (const t of tr) est[t.strat + ' ' + t.tf] = (est[t.strat + ' ' + t.tf] || 0) + 1;
+    return {
+      dia: S.reports.length + 1, inicio: w.start, fim: end, eq0: w.eq0, eq1: eq, pnl: eq - w.eq0, pct: eq / w.eq0 - 1,
+      btc0: w.px0, btc1: S.price, btcPct: w.px0 ? S.price / w.px0 - 1 : 0,
+      ops: tr.length, acertos: wins.length, taxa: tr.length ? wins.length / tr.length : null,
+      melhor: tr.length ? Math.max(...tr.map(t => t.net)) : null, pior: tr.length ? Math.min(...tr.map(t => t.net)) : null,
+      taxas: tr.reduce((s, t) => s + (t.fees || 0), 0), mdd: w.mdd,
+      tempoPosicionado: Math.min(1, w.inMkt / Math.max(1, Math.min(end, Date.now()) - w.start)),
+      estrategias: est, totalPct: eq / S.acc.start - 1, posAberta: !!S.acc.pos,
+    };
+  }
+  function trackWindow() {
+    if (!S.win) S.win = newWindow(S.startedAt);
+    const w = S.win, now = Date.now(), eq = equity();
+    if (S.acc.pos) w.inMkt += now - w.lastT; w.lastT = now;
+    if (eq > w.peak) w.peak = eq; const dd = 1 - eq / w.peak; if (dd > w.mdd) w.mdd = dd;
+    const end = S.startedAt + (S.reports.length + 1) * DAY;
+    if (now >= end) {
+      const r = summarize(w, end); S.reports.push(r);
+      log(`Relatório do dia ${r.dia}: ${pct(r.pct)} (${brl(r.pnl)}) em ${r.ops} operações · ${M.curto} no período ${pct(r.btcPct)}.`, r.pnl >= 0 ? 'b' : 's');
+      S.win = newWindow(end); save(true);
+    }
+  }
+  function holdPct() { const px0 = S.acc.eqHist.length ? S.acc.eqHist[0][2] : null; return px0 && S.price ? S.price / px0 - 1 : null }
+  function reportText() {
+    const a = S.acc, eq = equity(), days = (Date.now() - S.startedAt) / DAY, L = [];
+    L.push(`=== ${M.nome} (${SYMBOL}) ===`);
+    L.push(`Rodando desde ${quando(S.startedAt)} (${nf(days, 1)} dias, dia ${Math.floor(days) + 1} do teste). Dados ${S.dataOk ? 'ao vivo' : 'COM FALHA: ' + (S.lastErr || '')}. Último preço ${fmtPx(S.price)} às ${quando(S.lastTick)}.`);
+    L.push(`Patrimônio ${brl(eq)} · resultado total ${pct(eq / a.start - 1)} (${brl(eq - a.start)}) · ${a.trades.length} operações · acerto ${a.trades.length ? nf(a.trades.filter(t => t.net > 0).length / a.trades.length * 100, 0) + '%' : '—'} · taxas pagas ${brl(a.fees)} · maior queda ${nf(a.mdd * 100, 2)}%.`);
+    const h = holdPct(); if (h != null) L.push(`Comparação: ${M.curto} parado no mesmo período ${pct(h)}.`);
+    L.push(a.pos ? `Posição aberta: ${a.pos.dir > 0 ? 'COMPRA' : 'VENDA'} a ${fmtPx(a.pos.entry)} (${a.pos.strat} ${a.pos.tf}), resultado aberto ${brl(a.pos.dir * (S.price - a.pos.entry) * a.pos.qty)}.` : 'Sem posição aberta.');
+    L.push(S.active ? `Estratégia atual: ${S.active.st.nome} em ${S.active.tf}.` : 'Sem estratégia ativa (nenhuma vence as taxas agora).');
+    for (const r of S.reports.slice().reverse()) L.push(`Dia ${r.dia} (${quando(r.inicio)} → ${quando(r.fim)}): ${pct(r.pct)} (${brl(r.pnl)}) · ${r.ops} ops · acerto ${r.taxa == null ? '—' : nf(r.taxa * 100, 0) + '%'} · melhor ${r.melhor == null ? '—' : brl(r.melhor)} · pior ${r.pior == null ? '—' : brl(r.pior)} · taxas ${brl(r.taxas)} · maior queda ${nf(r.mdd * 100, 2)}% · posicionado ${nf(r.tempoPosicionado * 100, 0)}% do tempo · ${M.curto} ${pct(r.btcPct)} · acumulado ${pct(r.totalPct)}.`);
+    if (S.win) { const p = summarize(S.win, Date.now()); L.push(`Parcial de hoje (desde ${quando(S.win.start)}): ${pct(p.pct)} (${brl(p.pnl)}) · ${p.ops} ops · ${M.curto} ${pct(p.btcPct)}.`) }
+    return L.join('\n');
+  }
+  function estado() {
+    if (!S.dataOk && S.lastTick === 0) return 'iniciando'; if (!S.dataOk) return 'sem-dados';
+    const a = S.acc; if (a.pos) return a.pos.dir > 0 ? 'comprado' : 'vendido'; if (S.active) return 'espreita'; if (S.ranking.length) return 'fora'; return 'iniciando';
+  }
+  function ch24() { const c = S.candles['1h']; return c && c.length > 25 && S.price ? S.price / c[c.length - 25].c - 1 : null }
+  function overview() {
+    const a = S.acc, eq = a ? equity() : CFG.cap;
+    return { symbol: SYMBOL, nome: M.nome, curto: M.curto, prec: M.prec, price: S.price, ch24: ch24(), eq, start: a ? a.start : CFG.cap, nTrades: a ? a.trades.length : 0, estado: estado(), hold: a ? holdPct() : null, startedAt: S.startedAt };
+  }
+  function statePayload() {
+    const a = S.acc, eq = equity(), h = a.eqHist, step = Math.max(1, Math.ceil(h.length / 400));
+    const eqHist = h.filter((_, i) => i % step === 0 || i === h.length - 1).map(x => [x[0], x[1], x[2]]);
+    return {
+      symbol: SYMBOL, meta: M, now: Date.now(), startedAt: S.startedAt, bootAt: BOOT, cfg: { cap: CFG.cap, lev: CFG.lev, costPct: CFG.costPct, evalS: CFG.evalMs / 1000 },
+      price: S.price, lastTick: S.lastTick, ch24: ch24(), dataOk: S.dataOk, lastErr: S.lastErr, estado: estado(),
+      active: rowOf(S.active), pending: rowOf(S.pending), votes: S.votes, votesTf: S.votesTf, bias: S.bias,
+      ranking: S.ranking.slice(0, 12).map(rowOf), combos: S.ranking.length, lastTour: S.lastTour,
+      acc: { start: a.start, bal: a.bal, eq, peak: a.peak, mdd: a.mdd, fees: a.fees, pos: a.pos, nTrades: a.trades.length, wins: a.trades.filter(t => t.net > 0).length },
+      trades: a.trades.slice(0, 200), logs: S.logs.slice(0, 80), reports: S.reports,
+      parcial: S.win ? summarize(S.win, Date.now()) : null, eqHist,
+      btc0: a.eqHist.length ? a.eqHist[0][2] : null,
+    };
+  }
+  function periodic() { if (S.ready && S.ranking.length && Date.now() - S.lastTour > CFG.evalMs * 2) runTournament(false) }
+  function setDataError(msg) { S.lastErr = msg }
+  function markStale() { S.dataOk = false }
+  return { SYMBOL, M, S, init, loadHistory, afterHistory, onKline, save, summarize, reportText, statePayload, overview, periodic, setDataError, markStale, log, equity };
 }
-// Preço ao vivo pelo WebSocket da Binance: não gasta limite de requisições (o REST é usado só para o histórico).
+
+const bots = {}; for (const s of SYMBOLS) bots[s] = createBot(s);
+const list = () => SYMBOLS.map(s => bots[s]);
+async function loadAllHistory() { for (const b of list()) await b.loadHistory() }
+
+/* ---------------- WebSocket: um só para todos os ativos ---------------- */
 const WSS = process.env.WS_URL ? [process.env.WS_URL] : ['wss://data-stream.binance.vision/stream?streams=', 'wss://stream.binance.com:9443/stream?streams='];
 let ws = null, wsIdx = 0, lastMsg = 0, reconnecting = false, warned = false;
 function connectWS() {
-  const streams = E.TFS.map(t => SYMBOL.toLowerCase() + '@kline_' + t.id).join('/');
+  const streams = SYMBOLS.flatMap(s => E.TFS.map(t => s.toLowerCase() + '@kline_' + t.id)).join('/');
   const url = WSS[wsIdx % WSS.length] + streams;
   let me;
   try { me = ws = new WebSocket(url) } catch (e) { return scheduleReconnect('erro ao abrir a conexão: ' + e.message) }
-  me.onopen = () => { if (me !== ws) return; lastMsg = Date.now(); console.log('WebSocket conectado:', url.split('?')[0]) };
+  me.onopen = () => { if (me !== ws) return; lastMsg = Date.now(); console.log('WebSocket conectado:', url.split('?')[0], SYMBOLS.join(',')) };
   me.onmessage = ev => {
     if (me !== ws) return; lastMsg = Date.now();
-    try { const m = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); if (m.data && m.data.k) onKline(m.data.k) }
-    catch (e) { console.error('mensagem inválida:', e.message) }
+    try {
+      const m = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)), k = m.data && m.data.k;
+      if (k) { const b = bots[k.s || m.data.s]; if (b) b.onKline(k) }
+      if (warned) { warned = false; for (const b of list()) b.log('Dados da Binance voltaram ao normal.', 'k') }
+    } catch (e) { console.error('mensagem inválida:', e.message) }
   };
   me.onclose = () => { if (me === ws) scheduleReconnect('conexão com a Binance caiu') };
   me.onerror = () => { try { me.close() } catch (e) { } };
@@ -120,190 +320,50 @@ function connectWS() {
 function scheduleReconnect(why) {
   if (reconnecting) return; reconnecting = true;
   if (ws) { const o = ws; ws = null; try { o.onclose = null; o.close() } catch (e) { } }
-  S.lastErr = why; wsIdx++;
+  for (const b of list()) b.setDataError(why);
+  wsIdx++;
   const retry = async () => {
-    try { await loadHistory() }
+    try { await loadAllHistory(); for (const b of list()) b.afterHistory(false) }
     catch (e) {
-      S.lastErr = e.message;
       const w = Math.max(30000, cooldownUntil - Date.now());
-      log('Não consegui recarregar o histórico (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 'w');
+      for (const b of list()) { b.setDataError(e.message) }
+      bots[SYMBOLS[0]].log('Não consegui recarregar o histórico (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 'w');
       return setTimeout(retry, w);
     }
     reconnecting = false; connectWS();
   };
   setTimeout(retry, 5000);
 }
-function onKline(k) {
-  const tf = k.i, arr = S.candles[tf]; if (!arr) return;
-  const c = { t: k.t, o: +k.o, h: +k.h, l: +k.l, c: +k.c, v: +k.v }, last = arr[arr.length - 1];
-  if (last && last.t === c.t) arr[arr.length - 1] = c;
-  else if (!last || c.t > last.t) { arr.push(c); if (arr.length > MAXC) arr.shift() }
-  else return;
-  if (!S.dataOk || warned) { if (warned) log('Dados da Binance voltaram ao normal.', 'k'); warned = false }
-  S.dataOk = true; S.lastErr = null;
-  if (tf === '1m') tick(c.c);
-  if (k.x) candleClosed(tf, arr.length - 1);
-}
 setInterval(() => {
   if (!lastMsg || reconnecting) return;
   if (Date.now() - lastMsg > 60000) {
-    S.dataOk = false;
-    if (!warned) { warned = true; log('Sem preço da Binance há mais de 1 minuto. Reconectando.', 'w') }
+    for (const b of list()) b.markStale();
+    if (!warned) { warned = true; for (const b of list()) b.log('Sem preço da Binance há mais de 1 minuto. Reconectando.', 'w') }
     lastMsg = Date.now(); scheduleReconnect('sem mensagens da Binance');
   }
 }, 15000);
 
-/* ---------------- cérebro ---------------- */
-function rowOf(r) { return r && { key: r.key, tf: r.tf, nome: r.st.nome, fam: r.st.fam, f: r.st.f || null, risco: r.rk.nome, perDay: r.perDay, win: r.win, trades: r.trades, mdd: r.mdd, score: r.score } }
-function runTournament(reason) {
-  const t0 = Date.now(); const res = E.tournament(S.candles, COST);
-  S.ranking = res; S.lastTour = Date.now();
-  const best = res[0]; if (!best) return;
-  const ok = best.score > 0 || CFG.always;
-  if (reason) log(`Torneio: testei ${res.length} combinações (${E.STRATS.length} estratégias × ${E.TFS.length} tempos × ${E.RISKS.length} perfis de stop) em ${Date.now() - t0} ms.`);
-  const cur = S.active && S.active.key;
-  if (!ok) {
-    if (S.active && !S.acc.pos) { log(`Nenhuma estratégia está ganhando depois das taxas. Melhor: ${best.st.nome} em ${best.tf} com ${pct(best.perDay, 3)}/dia. Fico de fora.`, 'w'); S.active = null }
-    else if (!S.active && reason) log(`Nenhuma estratégia passou do zero depois das taxas (melhor: ${pct(best.perDay, 3)}/dia). Fico de fora e sigo observando.`, 'w');
-    if (S.acc.pos) S.pending = null;
-  } else if (best.key !== cur) {
-    if (S.acc.pos) { if (!S.pending || S.pending.key !== best.key) { S.pending = best; log(`Nova líder: ${best.st.nome} em ${best.tf}. Troco quando a posição atual fechar.`) } }
-    else { S.active = best; S.pending = null; log(`Assumo ${best.st.nome} no gráfico de ${best.tf} (${best.rk.nome}): ${pct(best.perDay, 3)}/dia no histórico, ${nf(best.win * 100, 0)}% de acerto em ${best.trades} operações.`, 'k') }
-  } else if (reason) log(`Mantenho ${best.st.nome} em ${best.tf}: segue na liderança com ${pct(best.perDay, 3)}/dia.`);
-  else S.active = best;
-}
-function updateVotes() {
-  const tf = S.active ? S.active.tf : '5m', c = S.candles[tf]; if (!c || c.length < E.WARM) return;
-  const I = E.makeInd(c); S.votes = E.votes(I, c.length - 1); S.votesTf = tf;
-  const v = S.votes; S.bias = (v.tend + v.mom + v.forca + v.bandas + v.romp) / 5;
-}
-function why(I, i, act, s) {
-  const v = E.votes(I, i), parts = ['RSI ' + nf(I.rsi(14)[i], 1), 'tendência ' + (v.tend > 0 ? 'de alta' : 'de baixa')];
-  if (act.st.fam === 'reversão') parts.push(s > 0 ? 'preço esticado para baixo' : 'preço esticado para cima');
-  if (act.st.fam === 'rompimento') parts.push(s > 0 ? 'rompeu a máxima recente' : 'perdeu a mínima recente');
-  return parts.join(' · ');
-}
-function candleClosed(tf, idx) {
-  if (tf === '1m' && Date.now() - S.lastTour >= CFG.evalMs) runTournament(true);
-  if (tf === '1m') updateVotes();
-  const act = S.active; if (!act || act.tf !== tf || S.price == null) return;
-  const c = S.candles[tf], I = E.makeInd(c), s = act.st.sig(I, idx), a = S.acc, px = S.price;
-  const tag = `${act.st.nome} (${tf})`;
-  if (s === null) return;
-  if (s === 0) { if (a.pos) closePos(px, 'sinal de saída de ' + tag); return }
-  if (a.pos && a.pos.dir === s) return;
-  if (a.pos) closePos(px, 'sinal contrário de ' + tag);
-  if (S.active !== act) return;
-  if (S.pending) { S.active = S.pending; S.pending = null; log(`Troco para ${S.active.st.nome} em ${S.active.tf}.`, 'k'); return }
-  const atr = I.atr(14)[idx]; if (!(atr > 0)) return;
-  openPos(s, px, atr, act, why(I, idx, act, s));
-}
-function openPos(dir, px, atr, act, reason) {
-  const a = S.acc, notional = equity(px) * CFG.lev, qty = notional / px, fee = notional * COST;
-  a.bal -= fee; a.fees += fee;
-  a.pos = { dir, entry: px, qty, sl: px - dir * act.rk.sl * atr, tp: px + dir * act.rk.tp * atr, t: Date.now(), strat: act.st.nome, tf: act.tf, key: act.key, fee };
-  log(`${dir > 0 ? 'COMPRA' : 'VENDA'} simulada a ${fmtPx(px)} · ${act.st.nome} (${act.tf}) · ${reason}. Stop ${fmtPx(a.pos.sl)}, alvo ${fmtPx(a.pos.tp)}.`, dir > 0 ? 'b' : 's');
-  save(true);
-}
-function closePos(px, reason) {
-  const a = S.acc, p = a.pos; if (!p) return;
-  const gross = p.dir * (px - p.entry) * p.qty, fee = px * p.qty * COST, net = gross - fee - p.fee;
-  a.bal += gross - fee; a.fees += fee;
-  a.trades.unshift({ dir: p.dir, entry: p.entry, exit: px, t0: p.t, t1: Date.now(), net, fees: fee + p.fee, strat: p.strat, tf: p.tf, reason });
-  if (a.trades.length > 2000) a.trades.length = 2000;
-  a.pos = null;
-  log(`Encerrei ${p.dir > 0 ? 'compra' : 'venda'} a ${fmtPx(px)} (${reason}): ${net >= 0 ? 'ganho' : 'perda'} de ${brl(Math.abs(net))} já com taxas.`, net >= 0 ? 'b' : 's');
-  if (S.pending) { S.active = S.pending; S.pending = null; log(`Agora assumo ${S.active.st.nome} em ${S.active.tf}.`, 'k') }
-  save(true);
-}
-function tick(px) {
-  S.price = px; S.lastTick = Date.now();
-  const a = S.acc, p = a.pos;
-  if (p) {
-    if (p.dir > 0 && px <= p.sl) closePos(px, 'stop'); else if (p.dir > 0 && px >= p.tp) closePos(px, 'alvo atingido');
-    else if (p.dir < 0 && px >= p.sl) closePos(px, 'stop'); else if (p.dir < 0 && px <= p.tp) closePos(px, 'alvo atingido');
-  }
-  const eq = equity(px); if (eq > a.peak) a.peak = eq; const dd = 1 - eq / a.peak; if (dd > a.mdd) a.mdd = dd;
-  const h = a.eqHist, now = Date.now();
-  if (!h.length || now - h[h.length - 1][0] >= 60000) { h.push([now, Math.round(eq * 100) / 100, px]); if (h.length > 15000) h.shift() }
-  trackWindow();
-  save();
-}
-
-/* ---------------- relatórios de 24h ---------------- */
-function newWindow(start) { const eq = equity(); return { start, eq0: eq, px0: S.price, peak: eq, mdd: 0, inMkt: 0, lastT: Date.now() } }
-function summarize(w, end) {
-  const eq = equity(), tr = S.acc.trades.filter(t => t.t1 >= w.start && t.t1 < end), wins = tr.filter(t => t.net > 0);
-  const est = {}; for (const t of tr) est[t.strat + ' ' + t.tf] = (est[t.strat + ' ' + t.tf] || 0) + 1;
-  return {
-    dia: S.reports.length + 1, inicio: w.start, fim: end, eq0: w.eq0, eq1: eq, pnl: eq - w.eq0, pct: eq / w.eq0 - 1,
-    btc0: w.px0, btc1: S.price, btcPct: w.px0 ? S.price / w.px0 - 1 : 0,
-    ops: tr.length, acertos: wins.length, taxa: tr.length ? wins.length / tr.length : null,
-    melhor: tr.length ? Math.max(...tr.map(t => t.net)) : null, pior: tr.length ? Math.min(...tr.map(t => t.net)) : null,
-    taxas: tr.reduce((s, t) => s + (t.fees || 0), 0), mdd: w.mdd,
-    tempoPosicionado: Math.min(1, w.inMkt / Math.max(1, Math.min(end, Date.now()) - w.start)),
-    estrategias: est, totalPct: eq / S.acc.start - 1, posAberta: !!S.acc.pos,
-  };
-}
-function trackWindow() {
-  if (!S.win) S.win = newWindow(S.startedAt);
-  const w = S.win, now = Date.now(), eq = equity();
-  if (S.acc.pos) w.inMkt += now - w.lastT; w.lastT = now;
-  if (eq > w.peak) w.peak = eq; const dd = 1 - eq / w.peak; if (dd > w.mdd) w.mdd = dd;
-  const end = S.startedAt + (S.reports.length + 1) * DAY;
-  if (now >= end) {
-    const r = summarize(w, end); S.reports.push(r);
-    log(`Relatório do dia ${r.dia}: ${pct(r.pct)} (${brl(r.pnl)}) em ${r.ops} operações · BTC no período ${pct(r.btcPct)}.`, r.pnl >= 0 ? 'b' : 's');
-    S.win = newWindow(end); save(true);
-  }
-}
-function reportText() {
-  const a = S.acc, eq = equity(), days = (Date.now() - S.startedAt) / DAY;
-  const L = [];
-  L.push(`NÚCLEO TRADER — relatório (${SYMBOL}, dinheiro simulado)`);
-  L.push(`Rodando desde ${quando(S.startedAt)} (${nf(days, 1)} dias). Dados ${S.dataOk ? 'ao vivo' : 'COM FALHA: ' + (S.lastErr || '')}. Último preço ${fmtPx(S.price)} às ${quando(S.lastTick)}.`);
-  L.push(`Configuração: capital ${brl(a.start)}, alavancagem ${CFG.lev}x, taxa ${nf(CFG.costPct, 2)}% por lado.`);
-  L.push(`Patrimônio ${brl(eq)} · resultado total ${pct(eq / a.start - 1)} (${brl(eq - a.start)}) · ${a.trades.length} operações · acerto ${a.trades.length ? nf(a.trades.filter(t => t.net > 0).length / a.trades.length * 100, 0) + '%' : '—'} · taxas pagas ${brl(a.fees)} · maior queda ${nf(a.mdd * 100, 2)}%.`);
-  if (S.startedAt && S.acc.eqHist.length) { const px0 = S.acc.eqHist[0][2]; if (px0) L.push(`Comparação: BTC parado no mesmo período ${pct(S.price / px0 - 1)}.`) }
-  L.push(a.pos ? `Posição aberta: ${a.pos.dir > 0 ? 'COMPRA' : 'VENDA'} a ${fmtPx(a.pos.entry)} (${a.pos.strat} ${a.pos.tf}), resultado aberto ${brl(a.pos.dir * (S.price - a.pos.entry) * a.pos.qty)}.` : 'Sem posição aberta.');
-  L.push(S.active ? `Estratégia atual: ${S.active.st.nome} em ${S.active.tf}.` : 'Sem estratégia ativa (nenhuma vence as taxas agora).');
-  L.push('');
-  for (const r of S.reports.slice().reverse()) L.push(`Dia ${r.dia} (${quando(r.inicio)} → ${quando(r.fim)}): ${pct(r.pct)} (${brl(r.pnl)}) · ${r.ops} ops · acerto ${r.taxa == null ? '—' : nf(r.taxa * 100, 0) + '%'} · melhor ${r.melhor == null ? '—' : brl(r.melhor)} · pior ${r.pior == null ? '—' : brl(r.pior)} · taxas ${brl(r.taxas)} · maior queda ${nf(r.mdd * 100, 2)}% · posicionado ${nf(r.tempoPosicionado * 100, 0)}% do tempo · BTC ${pct(r.btcPct)} · acumulado ${pct(r.totalPct)}.`);
-  if (S.win) { const p = summarize(S.win, Date.now()); L.push(`Parcial de hoje (desde ${quando(S.win.start)}): ${pct(p.pct)} (${brl(p.pnl)}) · ${p.ops} ops · BTC ${pct(p.btcPct)}.`) }
-  return L.join('\n');
-}
-
 /* ---------------- API ---------------- */
-function statePayload() {
-  const a = S.acc, eq = equity(), h = a.eqHist, step = Math.max(1, Math.ceil(h.length / 400));
-  const eqHist = h.filter((_, i) => i % step === 0 || i === h.length - 1).map(x => [x[0], x[1], x[2]]);
-  const c1h = S.candles['1h'];
-  const ch24 = c1h && c1h.length > 25 && S.price ? S.price / c1h[c1h.length - 25].c - 1 : null;
-  let estado = 'iniciando';
-  if (!S.dataOk && S.lastTick === 0) estado = 'iniciando'; else if (!S.dataOk) estado = 'sem-dados';
-  else if (a.pos) estado = a.pos.dir > 0 ? 'comprado' : 'vendido'; else if (S.active) estado = 'espreita'; else if (S.ranking.length) estado = 'fora';
-  return {
-    symbol: SYMBOL, now: Date.now(), startedAt: S.startedAt, bootAt: S.bootAt, cfg: { cap: CFG.cap, lev: CFG.lev, costPct: CFG.costPct, evalS: CFG.evalMs / 1000 },
-    price: S.price, lastTick: S.lastTick, ch24, dataOk: S.dataOk, lastErr: S.lastErr, estado,
-    active: rowOf(S.active), pending: rowOf(S.pending), votes: S.votes, votesTf: S.votesTf, bias: S.bias,
-    ranking: S.ranking.slice(0, 12).map(rowOf), combos: S.ranking.length, lastTour: S.lastTour,
-    acc: { start: a.start, bal: a.bal, eq, peak: a.peak, mdd: a.mdd, fees: a.fees, pos: a.pos, nTrades: a.trades.length, wins: a.trades.filter(t => t.net > 0).length },
-    trades: a.trades.slice(0, 200), logs: S.logs.slice(0, 80), reports: S.reports,
-    parcial: S.win ? summarize(S.win, Date.now()) : null, eqHist,
-    btc0: a.eqHist.length ? a.eqHist[0][2] : null,
-  };
+function fullReport() {
+  const all = list(), eq = all.reduce((s, b) => s + (b.S.acc ? b.equity() : CFG.cap), 0), cap = all.length * CFG.cap;
+  const L = [`NÚCLEO TRADER — relatório (dinheiro simulado, ${all.length} ativos com ${brl(CFG.cap)} cada)`,
+    `Configuração: alavancagem ${CFG.lev}x, taxa ${nf(CFG.costPct, 2)}% por lado. Carteira somada: ${brl(eq)} de ${brl(cap)} (${pct(eq / cap - 1)}).`, ''];
+  for (const b of all) { if (b.S.acc) { L.push(b.reportText()); L.push('') } }
+  return L.join('\n');
 }
 const PUB = path.join(__dirname, 'public');
 const files = { '/': ['index.html', 'text/html; charset=utf-8', 'no-cache'], '/lw.js': ['lw.js', 'application/javascript', 'public, max-age=86400'] };
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
   const json = (o, code = 200) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(o)) };
+  const bot = () => bots[(u.searchParams.get('s') || SYMBOLS[0]).toUpperCase()];
   try {
     if (u.pathname === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('ok') }
-    if (u.pathname === '/api/state') return json(statePayload());
-    if (u.pathname === '/api/candles') { const tf = u.searchParams.get('tf') || '5m'; const c = S.candles[tf]; if (!c) return json({ error: 'tf inválido' }, 400); return json({ tf, candles: c.slice(-300) }) }
-    if (u.pathname === '/api/report') return json({ reports: S.reports, parcial: S.win ? summarize(S.win, Date.now()) : null, texto: reportText() });
-    if (u.pathname === '/relatorio') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); return res.end(reportText()) }
+    if (u.pathname === '/api/overview') return json({ now: Date.now(), cfg: { cap: CFG.cap, lev: CFG.lev, costPct: CFG.costPct }, assets: list().map(b => b.overview()) });
+    if (u.pathname === '/api/state') { const b = bot(); if (!b || !b.S.acc) return json({ error: 'ativo indisponível' }, 404); return json(b.statePayload()) }
+    if (u.pathname === '/api/candles') { const b = bot(), tf = u.searchParams.get('tf') || '5m'; const c = b && b.S.candles[tf]; if (!c) return json({ error: 'ativo ou tempo inválido' }, 400); return json({ tf, candles: c.slice(-300) }) }
+    if (u.pathname === '/api/report') return json({ assets: list().filter(b => b.S.acc).map(b => ({ symbol: b.SYMBOL, reports: b.S.reports, parcial: b.S.win ? b.summarize(b.S.win, Date.now()) : null })), texto: fullReport() });
+    if (u.pathname === '/relatorio') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); return res.end(fullReport()) }
     const f = files[u.pathname];
     if (f) { res.writeHead(200, { 'content-type': f[1], 'cache-control': f[2] }); return fs.createReadStream(path.join(PUB, f[0])).pipe(res) }
     res.writeHead(404); res.end('não encontrado');
@@ -312,37 +372,24 @@ const server = http.createServer((req, res) => {
 
 /* ---------------- inicialização ---------------- */
 async function boot() {
-  server.listen(PORT, () => console.log('Núcleo Trader ouvindo na porta ' + PORT));
+  server.listen(PORT, () => console.log('Núcleo Trader ouvindo na porta ' + PORT + ' · ativos: ' + SYMBOLS.join(', ')));
   // o plano grátis do Render dorme sem acessos; o próprio robô se acessa a cada 10 min (já desde o início, mesmo esperando a Binance)
   const ext = process.env.RENDER_EXTERNAL_URL;
   if (ext) setInterval(() => fetch(ext + '/health').catch(() => { }), 10 * 60e3);
   await initRedis();
-  const st = await loadState();
-  if (st && st.acc) {
-    S.startedAt = st.startedAt; S.acc = st.acc; S.logs = st.logs || []; S.reports = st.reports || []; S.win = st.win || null;
-    if (S.acc.fees == null) S.acc.fees = 0;
-    log(`Servidor reiniciado: retomei a conta (${brl(S.acc.bal)} de saldo, ${S.acc.trades.length} operações, dia ${S.reports.length + 1}).`, 'k');
-  } else {
-    S.acc = freshAcc();
-    log(`Robô iniciado em ${SYMBOL} com ${brl(CFG.cap)} simulados · alavancagem ${CFG.lev}x · taxa ${nf(CFG.costPct, 2)}% por lado (igual à Binance).`, 'k');
-  }
+  for (const b of list()) await b.init();
   for (;;) {
-    try { await loadHistory(); break }
-    catch (e) { S.lastErr = e.message; const w = Math.max(15000, cooldownUntil - Date.now()); log('Não consegui baixar o histórico da Binance (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 's'); await new Promise(r => setTimeout(r, w)) }
+    try { await loadAllHistory(); break }
+    catch (e) {
+      const w = Math.max(15000, cooldownUntil - Date.now());
+      for (const b of list()) b.setDataError(e.message);
+      bots[SYMBOLS[0]].log('Não consegui baixar o histórico da Binance (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 's');
+      await new Promise(r => setTimeout(r, w));
+    }
   }
-  const one = S.candles['1m']; S.price = one[one.length - 1].c; S.lastTick = Date.now(); S.dataOk = true;
-  log(`Histórico carregado: ${E.TFS.map(t => S.candles[t.id].length + '×' + t.id).join(', ')}.`);
-  if (!S.win) S.win = newWindow(S.startedAt);
-  if (!S.acc.eqHist.length) S.acc.eqHist.push([Date.now(), S.acc.bal, S.price]);
-  runTournament(true);
-  if (S.acc.pos) {
-    const r = S.ranking.find(x => x.key === S.acc.pos.key);
-    if (r) S.active = r;
-    log(`Retomei a posição aberta de ${S.acc.pos.dir > 0 ? 'compra' : 'venda'} a ${fmtPx(S.acc.pos.entry)}.`, 'k');
-  }
-  updateVotes(); save(true);
+  for (const b of list()) b.afterHistory(true);
   connectWS(); lastMsg = Date.now();
-  setInterval(() => { if (S.ranking.length && Date.now() - S.lastTour > CFG.evalMs * 2) runTournament(false) }, 15000);
+  setInterval(() => { for (const b of list()) b.periodic() }, 15000);
 }
-process.on('SIGTERM', async () => { try { await save(true) } finally { process.exit(0) } });
+process.on('SIGTERM', async () => { try { await Promise.all(list().map(b => b.save(true))) } finally { process.exit(0) } });
 boot();

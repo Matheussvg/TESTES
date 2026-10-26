@@ -36,6 +36,8 @@ header{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:10px
 .warn .dot{background:var(--amber)} .err .dot{background:var(--sell)}
 @keyframes blink{50%{opacity:.35}}
 .quote{margin-left:auto;text-align:right}
+.seg.assets button{padding:7px 10px;font-size:12px}
+.seg.assets button span{font-size:10.5px;margin-left:3px}
 .quote b{display:block;font:600 21px/1 var(--mono);font-variant-numeric:tabular-nums}
 .quote small{font:500 11px/1 var(--mono);color:var(--dim)}
 
@@ -128,16 +130,17 @@ tr.active td.nm{color:var(--amber)}
 </head>
 <body>
 <header>
-  <div class="brand"><h1>NÚCLEO <span>TRADER</span></h1><small>robô na nuvem · BTC/BRL · dinheiro simulado</small></div>
+  <div class="brand"><h1>NÚCLEO <span>TRADER</span></h1><small>robô na nuvem · vários ativos · dinheiro simulado</small></div>
   <span class="pill sim">● SIMULAÇÃO</span>
   <span class="pill" id="conn"><span class="dot"></span><span id="connTxt">conectando…</span></span>
+  <div class="seg assets" id="assetSeg" role="group" aria-label="Ativo"></div>
   <div class="quote"><b id="px">—</b><small id="pxSub">—</small></div>
 </header>
 
 <div class="summary">
   <div class="tile"><span class="lbl">Patrimônio</span><b id="tEq">—</b><small id="tEqSub">—</small></div>
   <div class="tile"><span class="lbl">Resultado total</span><b id="tRes">—</b><small id="tResSub">—</small></div>
-  <div class="tile"><span class="lbl">BTC parado no período</span><b id="tHold">—</b><small id="tHoldSub">comparação: só comprar e segurar</small></div>
+  <div class="tile"><span class="lbl" id="holdLbl">Ativo parado no período</span><b id="tHold">—</b><small id="tHoldSub">comparação: só comprar e segurar</small></div>
   <div class="tile"><span class="lbl">Teste de 7 dias</span><b id="tDay">—</b><div class="week" id="week"></div></div>
 </div>
 
@@ -183,7 +186,7 @@ tr.active td.nm{color:var(--amber)}
       <div class="ph"><h2>Curva de patrimônio</h2><span class="lbl" id="cfgLbl">—</span></div>
       <div class="pb">
         <canvas id="equity"></canvas>
-        <div class="eqleg"><span style="color:var(--buy)">robô</span><span style="color:var(--violet)">BTC parado</span><span style="color:var(--faint)">capital inicial</span></div>
+        <div class="eqleg"><span style="color:var(--buy)">robô</span><span style="color:var(--violet)" id="holdLeg">ativo parado</span><span style="color:var(--faint)">capital inicial</span></div>
       </div>
     </section>
     <section class="panel o7">
@@ -209,19 +212,35 @@ const brl=v=>Number(v).toLocaleString('pt-BR',{style:'currency',currency:'BRL'})
 const pct=(v,d=2)=>(v>=0?'+':'')+nf(v*100,d)+'%';
 const hhmm=t=>new Date(t).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
 const dmh=t=>new Date(t).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
-const fpx=v=>v==null?'—':nf(v,0);
+const fpx=v=>v==null?'—':nf(v,ST&&ST.meta?ST.meta.prec:0);
 const tzShift=t=>Math.floor(t/1000)-new Date(t).getTimezoneOffset()*60;
 const cls=v=>v>=0?'pos':'neg';
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
 const TFS=[['1m',60e3],['3m',180e3],['5m',300e3],['15m',900e3],['1h',3600e3]];
 const VN={tend:'Tendência',mom:'Momento',forca:'Força (RSI)',bandas:'Bandas',romp:'Rompimento',volume:'Volume'};
+let SYM=(()=>{try{return localStorage.getItem('nt.sym')}catch(e){return null}})(),OV=null,loadedSym=null,precApplied=null;
 let ST=null,viewTf=(()=>{try{return localStorage.getItem('nt.tf')||'auto'}catch(e){return 'auto'}})(),candles=[],loadedTf=null,lastCandleFetch=0,serverOff=0;
 
 /* ---------- estado do servidor ---------- */
-async function pull(){
-  try{const r=await fetch('api/state',{cache:'no-store'});if(!r.ok)throw new Error(r.status);ST=await r.json();serverOff=0;render()}
+async function fetchState(){
+  if(!SYM)return;const want=SYM;
+  try{const r=await fetch('api/state?s='+want,{cache:'no-store'});if(!r.ok)throw new Error(r.status);const j=await r.json();if(j.symbol!==SYM)return;ST=j;serverOff=0;render()}
   catch(e){serverOff++;if(serverOff>2)setConn('err','servidor acordando ou fora do ar…')}
-  setTimeout(pull,3000);
+}
+async function pull(){await fetchState();setTimeout(pull,3000)}
+async function pullOverview(){
+  try{const r=await fetch('api/overview',{cache:'no-store'});OV=await r.json();
+    if(!SYM||!OV.assets.some(a=>a.symbol===SYM)){SYM=OV.assets[0].symbol;fetchState()}
+    renderAssets()}catch(e){}
+  setTimeout(pullOverview,10000);
+}
+function renderAssets(){
+  if(!OV)return;
+  $('assetSeg').innerHTML=OV.assets.map(a=>{const r=a.eq/a.start-1;return `<button type="button" data-s="${a.symbol}" aria-pressed="${a.symbol===SYM}">${esc(a.curto)} <span class="${cls(r)}">${pct(r,1)}</span></button>`}).join('');
+}
+function switchAsset(sym){
+  if(sym===SYM)return;SYM=sym;try{localStorage.setItem('nt.sym',sym)}catch(e){}
+  ST=null;loadedTf=null;loadedSym=null;mkSig='';$('sigs').innerHTML='';candles=[];renderAssets();fetchState();
 }
 function setConn(c,t){$('conn').className='pill '+c;$('connTxt').textContent=t}
 const shownTf=()=>viewTf==='auto'?(ST&&ST.active?ST.active.tf:(ST&&ST.ranking[0]?ST.ranking[0].tf:'5m')):viewTf;
@@ -230,7 +249,9 @@ function render(){
   const s=ST,a=s.acc,age=(s.now-s.lastTick)/1000;
   if(!s.dataOk)setConn('err','sem dados da Binance');else if(age>30)setConn('warn','último preço há '+Math.round(age)+' s');else setConn('live','AO VIVO · robô na nuvem');
   $('px').textContent=s.price==null?'—':'R$ '+fpx(s.price);
-  $('pxSub').textContent='BTC/BRL'+(s.ch24!=null?' · 24h '+pct(s.ch24):'');
+  $('pxSub').textContent=s.meta.nome+(s.ch24!=null?' · 24h '+pct(s.ch24):'');
+  $('holdLbl').textContent=s.meta.curto+' parado no período';$('holdLeg').textContent=s.meta.curto+' parado';
+  if(cs&&precApplied!==s.meta.prec){precApplied=s.meta.prec;cs.applyOptions({priceFormat:{type:'price',precision:s.meta.prec,minMove:Math.pow(10,-s.meta.prec)}})}
   // resumo
   $('tEq').textContent=brl(a.eq);$('tEqSub').textContent='começou com '+brl(a.start);
   const res=a.eq/a.start-1;$('tRes').textContent=pct(res);$('tRes').className=cls(res);
@@ -263,7 +284,7 @@ function card(r,today){
   return `<div class="rep${today?' today':''}"><h3>${today?'HOJE · parcial':'DIA '+r.dia}</h3><span class="res ${cls(r.pnl)}">${pct(r.pct)}</span>
   <p>${dmh(r.inicio)} → ${today?'agora':dmh(r.fim)} · <b class="${cls(r.pnl)}">${(r.pnl>=0?'+':'')+brl(r.pnl)}</b><br>
   ${r.ops} operações · acerto <b>${r.taxa==null?'—':nf(r.taxa*100,0)+'%'}</b> · maior queda <b>${nf(r.mdd*100,2)}%</b><br>
-  BTC no período <b class="${cls(r.btcPct)}">${pct(r.btcPct)}</b> · posicionado ${nf(r.tempoPosicionado*100,0)}% do tempo · taxas ${brl(r.taxas)}${est?'<br>usou: '+esc(est):''}</p></div>`;
+  ${esc(ST.meta.curto)} no período <b class="${cls(r.btcPct)}">${pct(r.btcPct)}</b> · posicionado ${nf(r.tempoPosicionado*100,0)}% do tempo · taxas ${brl(r.taxas)}${est?'<br>usou: '+esc(est):''}</p></div>`;
 }
 function renderTrades(){
   const t=ST.trades;$('tradeCount').textContent=ST.acc.nTrades+' fechadas · '+(ST.acc.nTrades?nf(ST.acc.wins/ST.acc.nTrades*100,0)+'% acerto':'—');
@@ -319,7 +340,7 @@ function overlays(){
   lu.setData(line(up));ll.setData(line(lo));
 }
 function markers(){
-  if(!candles.length||!ST)return;const ms=TFS.find(t=>t[0]===loadedTf)[1],first=candles[0].t,bk=t=>tzShift(Math.floor(t/ms)*ms),mk=[];
+  if(!candles.length||!ST||!loadedTf||loadedSym!==SYM)return;const ms=TFS.find(t=>t[0]===loadedTf)[1],first=candles[0].t,bk=t=>tzShift(Math.floor(t/ms)*ms),mk=[];
   for(const tr of ST.trades){if(tr.t1<first)continue;
     if(tr.t0>=first)mk.push({time:bk(tr.t0),position:tr.dir>0?'belowBar':'aboveBar',color:tr.dir>0?'#2fd39a':'#ff5470',shape:tr.dir>0?'arrowUp':'arrowDown',text:tr.dir>0?'C':'V'});
     mk.push({time:bk(tr.t1),position:tr.dir>0?'aboveBar':'belowBar',color:tr.net>=0?'#5ad1ff':'#ffb547',shape:'circle',text:(tr.net>=0?'+':'')+nf(tr.net,0)})}
@@ -333,7 +354,8 @@ async function loadCandles(force){
   if(loading||!ST)return;const tf=shownTf();
   if(!force&&tf===loadedTf&&Date.now()-lastCandleFetch<20000)return;
   loading=true;
-  try{const r=await fetch('api/candles?tf='+tf,{cache:'no-store'});const j=await r.json();candles=j.candles;loadedTf=tf;lastCandleFetch=Date.now();
+  const sym=SYM;
+  try{const r=await fetch('api/candles?s='+sym+'&tf='+tf,{cache:'no-store'});const j=await r.json();if(sym!==SYM||!j.candles){loading=false;return}candles=j.candles;loadedTf=tf;loadedSym=sym;lastCandleFetch=Date.now();
     cs.setData(candles.map(c=>({time:tzShift(c.t),open:c.o,high:c.h,low:c.l,close:c.c})));overlays();mkSig='';
     $('chartTf').textContent=tf+(viewTf==='auto'?' (o do robô)':'');
     document.querySelectorAll('#tfSeg button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.tf===viewTf)));
@@ -341,11 +363,11 @@ async function loadCandles(force){
   loading=false;
 }
 function chartTick(){
-  const tf=shownTf();if(tf!==loadedTf||Date.now()-lastCandleFetch>20000){loadCandles(tf!==loadedTf);}
+  const tf=shownTf();if(tf!==loadedTf||loadedSym!==SYM||Date.now()-lastCandleFetch>20000){loadCandles(tf!==loadedTf||loadedSym!==SYM);}
   else if(candles.length&&ST.price){const ms=TFS.find(t=>t[0]===tf)[1],b=Math.floor(ST.lastTick/ms)*ms,last=candles[candles.length-1];
     if(b===last.t){last.c=ST.price;last.h=Math.max(last.h,ST.price);last.l=Math.min(last.l,ST.price);try{cs.update({time:tzShift(last.t),open:last.o,high:last.h,low:last.l,close:last.c})}catch(e){}}
     else if(b>last.t)loadCandles(true)}
-  const sig=ST.acc.nTrades+'|'+(ST.acc.pos?ST.acc.pos.t:0)+'|'+loadedTf;if(sig!==mkSig){mkSig=sig;markers()}
+  const sig=SYM+'|'+ST.acc.nTrades+'|'+(ST.acc.pos?ST.acc.pos.t:0)+'|'+loadedTf+'|'+loadedSym;if(sig!==mkSig){mkSig=sig;markers()}
 }
 
 /* ---------- cérebro (visual) ---------- */
@@ -375,7 +397,8 @@ function drawBrain(){
   const gr=g.createRadialGradient(cx,cy,0,cx,cy,R*.55);gr.addColorStop(0,`hsla(${hue},95%,70%,${.25+pulse*.35})`);gr.addColorStop(1,'hsla(0,0%,0%,0)');g.fillStyle=gr;g.beginPath();g.arc(cx,cy,R*.6,0,7);g.fill();
   requestAnimationFrame(drawBrain);
 }
-initChart();requestAnimationFrame(drawBrain);pull();addEventListener('resize',drawEquity);
+initChart();requestAnimationFrame(drawBrain);pullOverview();pull();
+$('assetSeg').addEventListener('click',e=>{const b=e.target.closest('button');if(b)switchAsset(b.dataset.s)});addEventListener('resize',drawEquity);
 </script>
 </body>
 </html>
