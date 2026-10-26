@@ -310,7 +310,23 @@ function createBot(SYMBOL) {
   function periodic() { if (S.ready && S.ranking.length && Date.now() - S.lastTour > CFG.evalMs * 2) runTournament(false) }
   function setDataError(msg) { S.lastErr = msg }
   function markStale() { S.dataOk = false }
-  return { SYMBOL, M, S, init, loadHistory, afterHistory, onKline, save, summarize, reportText, statePayload, overview, periodic, setDataError, markStale, log, equity };
+  // histórico de velas guardado no banco: um reinício não depende da API da Binance (que bloqueia IPs compartilhados)
+  async function loadCache() {
+    if (!redis) return false;
+    try {
+      const raw = await redis.get('nt:candles:' + SYMBOL); if (!raw) return false;
+      const d = JSON.parse(raw);
+      if (Date.now() - d.savedAt > 12 * 3600e3) return false;
+      if (!LIVE_TFS.every(tf => d.candles[tf] && d.candles[tf].length > E.WARM + 60)) return false;
+      S.candles = d.candles; return d.savedAt;
+    } catch (e) { return false }
+  }
+  async function saveCache() {
+    if (!redis || !S.ready) return;
+    try { const c = {}; for (const tf of LIVE_TFS) c[tf] = (S.candles[tf] || []).slice(-500); await redis.set('nt:candles:' + SYMBOL, JSON.stringify({ savedAt: Date.now(), candles: c })) }
+    catch (e) { console.error('cache:', e.message) }
+  }
+  return { SYMBOL, M, S, init, loadHistory, afterHistory, loadCache, saveCache, onKline, save, summarize, reportText, statePayload, overview, periodic, setDataError, markStale, log, equity };
 }
 
 const bots = {}; for (const s of SYMBOLS) bots[s] = createBot(s);
@@ -342,17 +358,17 @@ function scheduleReconnect(why) {
   if (ws) { const o = ws; ws = null; try { o.onclose = null; o.close() } catch (e) { } }
   for (const b of list()) b.setDataError(why);
   wsIdx++;
-  const retry = async () => {
-    try { await loadAllHistory(); for (const b of list()) b.afterHistory(false) }
-    catch (e) {
-      const w = Math.max(30000, cooldownUntil - Date.now());
-      for (const b of list()) { b.setDataError(e.message) }
-      bots[SYMBOLS[0]].log('Não consegui recarregar o histórico (' + e.message + '). Tento de novo em ' + Math.round(w / 1000) + ' s.', 'w');
-      return setTimeout(retry, w);
-    }
-    reconnecting = false; connectWS();
-  };
-  setTimeout(retry, 5000);
+  // reconecta o preço ao vivo na hora; o buraco de velas é completado depois, quando a API deixar
+  setTimeout(() => { reconnecting = false; connectWS(); backfill() }, 5000);
+}
+let backfilling = false;
+async function backfill() {
+  if (backfilling) return; backfilling = true;
+  for (;;) {
+    try { await loadAllHistory(); for (const b of list()) b.afterHistory(false); break }
+    catch (e) { const w = Math.max(60000, cooldownUntil - Date.now()); console.log('completar histórico adiado ' + Math.round(w / 1000) + ' s:', e.message); await new Promise(r => setTimeout(r, w)) }
+  }
+  backfilling = false;
 }
 setInterval(() => {
   if (!lastMsg || reconnecting) return;
@@ -369,10 +385,15 @@ const LAB = { status: 'parado', startedAt: null, finishedAt: null, results: null
 async function fetchRange(sym, tf, total) {
   let out = [], end = Date.now();
   while (out.length < total) {
-    const d = await fetchJSON(`/api/v3/klines?symbol=${sym}&interval=${tf}&limit=${Math.min(1000, total - out.length)}&endTime=${end}`);
+    let d;
+    try { d = await fetchJSON(`/api/v3/klines?symbol=${sym}&interval=${tf}&limit=${Math.min(1000, total - out.length)}&endTime=${end}`) }
+    catch (e) {
+      if (cooldownUntil <= Date.now()) throw e;
+      LAB.status = 'aguardando a Binance liberar o acesso'; await new Promise(r => setTimeout(r, cooldownUntil - Date.now() + 2000)); LAB.status = 'baixando dados'; continue;
+    }
     if (!d.length) break;
     out = d.map(toC).concat(out); end = d[0][0] - 1;
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 1000));
   }
   return out;
 }
@@ -382,11 +403,11 @@ async function runLab(days) {
     const now = Date.now(), H = 3600e3, testEnd = Math.floor(now / H) * H, testStart = testEnd - days * 864e5, data = {};
     for (const sym of SYMBOLS) {
       data[sym] = {};
-      for (const tf of ['1m', '3m', '5m', '15m', '1h', '4h']) data[sym][tf] = await fetchRange(sym, tf, 520 + Math.ceil((now - testStart) / E.TFMS[tf]) + 2);
+      for (const tf of ['5m', '15m', '1h', '4h']) data[sym][tf] = await fetchRange(sym, tf, 520 + Math.ceil((now - testStart) / E.TFMS[tf]) + 2);
     }
     LAB.status = 'simulando';
     LAB.results = await new Promise((res, rej) => {
-      const w = new Worker(path.join(__dirname, 'lab.js'), { workerData: { data, modes: Object.keys(E.MODES), testStart, testEnd, step: H } });
+      const w = new Worker(path.join(__dirname, 'lab.js'), { workerData: { data, modes: ['v2', 'v3', 'v4'], testStart, testEnd, step: H } });
       w.once('message', res); w.once('error', rej); w.once('exit', c => { if (c) rej(new Error('simulação parou com código ' + c)) });
     });
     LAB.period = { testStart, testEnd, days }; LAB.status = 'pronto'; LAB.finishedAt = Date.now();
@@ -395,7 +416,8 @@ async function runLab(days) {
 function labText() {
   if (LAB.status !== 'pronto') return `Laboratório: ${LAB.status}${LAB.error ? ' (' + LAB.error + ')' : ''}${LAB.startedAt ? ', iniciado ' + quando(LAB.startedAt) : ''}. Abra /lab?run=1 para rodar.`;
   const L = [`LABORATÓRIO — robô inteiro reproduzido de ${quando(LAB.period.testStart)} a ${quando(LAB.period.testEnd)} (${LAB.period.days} dias), escolhendo a estratégia a cada hora só com o passado. R$ 10.000 por ativo.`, ''];
-  for (const id of Object.keys(E.MODES)) L.push(`${id}: ${E.MODES[id].nome}`);
+  for (const id of Object.keys(Object.values(LAB.results)[0] || {})) L.push(`${id}: ${E.MODES[id].nome}`);
+  L.push('(a v1 original já tem o resultado real ao vivo, então não precisa ser reproduzida)');
   for (const sym of Object.keys(LAB.results)) {
     L.push('', `=== ${META[sym].nome} (${sym}) — ativo parado no período: ${pct(Object.values(LAB.results[sym])[0].hold)} ===`);
     for (const [id, r] of Object.entries(LAB.results[sym])) L.push(`${id}: resultado ${pct(r.ret)} (${brl(r.ret * CFG.cap)}) · ${r.trades} operações · acerto ${r.win == null ? '—' : nf(r.win * 100, 0) + '%'} · taxas ${brl(r.fees * CFG.cap)} · maior queda ${nf(r.mdd * 100, 2)}% · posicionado ${nf(r.inMkt * 100, 0)}% do tempo · ${r.estrategias} estratégias diferentes usadas`);
@@ -426,7 +448,7 @@ const server = http.createServer((req, res) => {
     if (u.pathname === '/api/candles') { const b = bot(), tf = u.searchParams.get('tf') || '5m'; const c = b && b.S.candles[tf]; if (!c) return json({ error: 'ativo ou tempo inválido' }, 400); return json({ tf, candles: c.slice(-300) }) }
     if (u.pathname === '/api/report') return json({ assets: list().filter(b => b.S.acc).map(b => ({ symbol: b.SYMBOL, reports: b.S.reports, parcial: b.S.win ? b.summarize(b.S.win, Date.now()) : null })), texto: fullReport() });
     if (u.pathname === '/lab' || u.pathname === '/api/lab') {
-      const busy = LAB.status === 'baixando dados' || LAB.status === 'simulando';
+      const busy = ['baixando dados', 'simulando', 'aguardando a Binance liberar o acesso'].includes(LAB.status);
       if (u.searchParams.get('run') && !busy && (!LAB.finishedAt || Date.now() - LAB.finishedAt > 10 * 60e3)) runLab(Math.min(7, Math.max(1, +u.searchParams.get('dias') || 4)));
       if (u.pathname === '/api/lab') return json({ ...LAB, texto: labText() });
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }); return res.end(labText());
@@ -446,7 +468,9 @@ async function boot() {
   if (ext) setInterval(() => fetch(ext + '/health').catch(() => { }), 10 * 60e3);
   await initRedis();
   for (const b of list()) await b.init();
-  for (;;) {
+  let cached = true;
+  for (const b of list()) { const at = await b.loadCache(); if (at) b.log(`Retomei o histórico de velas guardado em ${quando(at)}, sem precisar da API da Binance.`, 'k'); else cached = false }
+  if (!cached) for (;;) {
     try { await loadAllHistory(); break }
     catch (e) {
       const w = Math.max(15000, cooldownUntil - Date.now());
@@ -457,7 +481,10 @@ async function boot() {
   }
   for (const b of list()) b.afterHistory(true);
   connectWS(); lastMsg = Date.now();
+  if (cached) backfill();
   setInterval(() => { for (const b of list()) b.periodic() }, 15000);
+  setInterval(() => { for (const b of list()) b.saveCache() }, 5 * 60e3);
+  setTimeout(() => { for (const b of list()) b.saveCache() }, 30e3);
 }
-process.on('SIGTERM', async () => { try { await Promise.all(list().map(b => b.save(true))) } finally { process.exit(0) } });
+process.on('SIGTERM', async () => { try { await Promise.all(list().flatMap(b => [b.save(true), b.saveCache()])) } finally { process.exit(0) } });
 boot();
