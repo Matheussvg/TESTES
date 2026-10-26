@@ -64,7 +64,7 @@ async function fetchJSON(p) {
       const r = await fetch(h + p, { signal: AbortSignal.timeout(8000) });
       if (r.status === 429 || r.status === 418) {
         const ra = Math.max(30, +r.headers.get('retry-after') || 60);
-        cooldownUntil = Date.now() + ra * 1000;
+        cooldownUntil = Date.now() + ra * 1000; saveCooldown();
         throw new Error('Binance pediu para esperar ' + ra + ' s (HTTP ' + r.status + ')');
       }
       if (!r.ok) throw new Error(h + ' HTTP ' + r.status);
@@ -73,6 +73,19 @@ async function fetchJSON(p) {
   }
   throw err;
 }
+
+function aggregate(arr, ms) {
+  const out = [];
+  for (const b of arr) {
+    const t = Math.floor(b.t / ms) * ms, x = out[out.length - 1];
+    if (!x || x.t !== t) out.push({ t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v });
+    else { x.h = Math.max(x.h, b.h); x.l = Math.min(x.l, b.l); x.c = b.c; x.v += b.v }
+  }
+  return out;
+}
+// o bloqueio da Binance vale para o IP, não para o processo: guardo no banco para um reinício não bater lá durante o castigo
+async function loadCooldown() { if (redis) try { const v = +(await redis.get('nt:cooldown')); if (v > cooldownUntil) cooldownUntil = v } catch (e) { } }
+function saveCooldown() { if (redis) redis.set('nt:cooldown', String(cooldownUntil)).catch(() => { }) }
 
 /* ================= um robô por ativo ================= */
 function createBot(SYMBOL) {
@@ -317,8 +330,16 @@ function createBot(SYMBOL) {
       const raw = await redis.get('nt:candles:' + SYMBOL); if (!raw) return false;
       const d = JSON.parse(raw);
       if (Date.now() - d.savedAt > 12 * 3600e3) return false;
-      if (!LIVE_TFS.every(tf => d.candles[tf] && d.candles[tf].length > E.WARM + 60)) return false;
-      S.candles = d.candles; return d.savedAt;
+      const ok = c => c && c.length > E.WARM + 60;
+      for (const tf of LIVE_TFS) {
+        if (ok(d.candles[tf])) continue;
+        // tempo que faltou no cache (ex.: 4h): monta a partir de um tempo menor que esteja guardado
+        const src = Object.keys(d.candles).filter(k => E.TFMS[k] && E.TFMS[k] < E.TFMS[tf] && E.TFMS[tf] % E.TFMS[k] === 0 && d.candles[k].length).sort((a, b) => E.TFMS[b] - E.TFMS[a])[0];
+        if (src) d.candles[tf] = aggregate(d.candles[src], E.TFMS[tf]);
+        if (!ok(d.candles[tf])) return false;
+      }
+      S.candles = {}; for (const tf of LIVE_TFS) S.candles[tf] = d.candles[tf];
+      return d.savedAt;
     } catch (e) { return false }
   }
   async function saveCache() {
@@ -467,6 +488,7 @@ async function boot() {
   const ext = process.env.RENDER_EXTERNAL_URL;
   if (ext) setInterval(() => fetch(ext + '/health').catch(() => { }), 10 * 60e3);
   await initRedis();
+  await loadCooldown();
   for (const b of list()) await b.init();
   let cached = true;
   for (const b of list()) { const at = await b.loadCache(); if (at) b.log(`Retomei o histórico de velas guardado em ${quando(at)}, sem precisar da API da Binance.`, 'k'); else cached = false }
@@ -481,7 +503,7 @@ async function boot() {
   }
   for (const b of list()) b.afterHistory(true);
   connectWS(); lastMsg = Date.now();
-  if (cached) backfill();
+  if (cached) setTimeout(backfill, 65 * 60e3);   // completa o buraco depois, longe de qualquer bloqueio recente
   setInterval(() => { for (const b of list()) b.periodic() }, 15000);
   setInterval(() => { for (const b of list()) b.saveCache() }, 5 * 60e3);
   setTimeout(() => { for (const b of list()) b.saveCache() }, 30e3);
